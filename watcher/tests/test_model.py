@@ -92,7 +92,8 @@ class TestModels(unittest.TestCase):
             'capture_time': '2021-01-01T12:00:00-07:00',
             'scene_name': 'scene1',
             'video_url': expected_url,
-            'labels': None
+            'labels': None,
+            'significant_frame': None,
         }
         self.assertEqual(rtr_evt.api_response_dict, expected_api_response)
         

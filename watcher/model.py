@@ -7,8 +7,8 @@ import subprocess
 from datetime import datetime, timezone
 
 from typing import Optional, List
-from sqlalchemy import JSON, ForeignKey, Integer, Text, text, select, desc 
-from sqlalchemy.orm import relationship, mapped_column, Mapped, DeclarativeBase
+from sqlalchemy import JSON, ForeignKey, Text, text, select, desc 
+from sqlalchemy.orm import relationship, mapped_column, Mapped, DeclarativeBase, joinedload
 
 from PIL import Image
 
@@ -67,6 +67,18 @@ class EventObservation(WatcherBase):
 
         results = session.execute(stmt).scalars().all()
         return results
+
+    @classmethod
+    def labeled(cls, session, limit=10):
+        stmt = (select(cls,Labeling)
+                .join(cls, cls.id == Labeling.event_id)
+                .where(Labeling.labels != None)
+                .where(Labeling.labels.not_like('%noise%'))
+                .order_by(desc(cls.capture_time)).limit(limit)
+                .options(joinedload(cls.labelings))
+                )
+
+        return [r[0] for r in session.execute(stmt).unique()]
 
     @classmethod
     def by_name(cls, session, name):
@@ -159,8 +171,6 @@ class EventObservation(WatcherBase):
         return sorted(labels)
 
     @property
-
-    @property
     def api_response_dict(self):
         return {
             'event_observation_id': self.id,
@@ -169,12 +179,18 @@ class EventObservation(WatcherBase):
             'scene_name': self.scene_name,
             'video_url': self.video_url,
             'labels': self.all_labels,
-            # 'significant_frame_number': self.
+            'significant_frame': self.significant_frame_url,
         }
+
+    @property
+    def significant_frame_url(self):
+        if not self.results: return None
+        return application_config('system','BASE_STATIC_PUBLIC_URL') + '/' + self.results[-1].file
 
     @property
     def video_url(self):
         return application_config('system','BASE_STATIC_PUBLIC_URL') + '/' + self.video_location + '/' + self.video_file
+
 
     @property
     def upload_dict(self):

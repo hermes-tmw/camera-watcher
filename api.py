@@ -26,7 +26,7 @@ from watcher.connection import get_db_url, redis_connection
 from watcher.remote import APIUser
 from watcher.lite_tasks import task_record_event, task_write_image
 
-from watcher import output, setup_logging, application_config
+from watcher import setup_logging, application_config
 
 DEFAULT_API_RESPONSE_PAGE_SIZE=10
 
@@ -77,7 +77,7 @@ def create_app(db_url=None, db_options={}, testing=False) -> Flask:
 
         return e, 400
 
-    def api_response_for_context(obj):
+    def api_response_as_json(obj):
         if app.is_cli:
             return json.dumps(obj, indent=2)
         else:
@@ -113,10 +113,25 @@ def create_app(db_url=None, db_options={}, testing=False) -> Flask:
 
         return 'ACCEPTED', 202
 
+    @app.route("/labeled")
+    @auth.login_required
+    def get_labled():
+        # before = None
+        # before_str = request.args.get("before")
+        # if before_str:
+        #     try:
+        #         localtz = pytz.timezone(application_config()['location'].get('TIMEZONE'))
+        #         before = datetime.fromisoformat(before_str).astimezone(localtz)
+        #         app.logger.debug(f"fetching events before: {before.isoformat()}")
+        #     except (TypeError, ValueError) as pe:
+        #         app.logger.debug(f"skipping 'before' parameter: {pe}")
+
+        events = EventObservation.labeled(db.session, DEFAULT_API_RESPONSE_PAGE_SIZE)
+        return api_response_as_json([e.api_response_dict for e in events])
+    
     @app.route("/uncategorized")
     @auth.login_required
     def get_uncategorized():
-
         before = None
         before_str = request.args.get("before")
         if before_str:
@@ -129,7 +144,7 @@ def create_app(db_url=None, db_options={}, testing=False) -> Flask:
 
         observations = EventObservation.uncategorized(db.session, before, DEFAULT_API_RESPONSE_PAGE_SIZE)
 
-        return api_response_for_context([o.api_response_dict for o in observations])
+        return api_response_as_json([o.api_response_dict for o in observations])
 
     @app.route("/labels")
     @auth.login_required

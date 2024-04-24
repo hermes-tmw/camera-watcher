@@ -46,6 +46,11 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIsInstance(response.json, list)
 
+    def test_get_labeled(self):
+        response = self.app.get('/labeled', headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsInstance(response.json, list)
+
     def test_get_labels(self):
         response = self.app.get('/labels', headers=self.headers)
         self.assertEqual(response.status_code, 200)
@@ -120,11 +125,31 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         respitem = response.json[0]
         self.assertIsInstance(respitem, dict)
+        self.assertTrue(respitem['significant_frame'].endswith('test.jpg'))
 
-        self.assertDictContainsSubset({
-            'significant_frame_number':77,
-            'significant_frame_image':'test.jpg'
-        },respitem)
+    def test_labeled(self):
+        data = {
+            'filetype': 8,
+            'event_name': 'test_event',
+            'video_file': 'test_video.mp4',
+            'scene_name': 'test_scene'
+        }
+        response = self.app.post('/observations', headers=self.headers, json=data)
+        self.assertIn(response.status_code, [200, 201])
+
+        evt_id=response.json['event_observation_id']
+        self.assertIsInstance(evt_id, int)
+
+        data = {
+            'labels': ['label1', 'label2', 'label3'],
+            'event_observation_id': evt_id
+        }
+        response = self.app.post('/classify', headers=self.headers, json=data)
+        self.assertEqual(response.status_code, 201)
+
+        response = self.app.get('/labeled', headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json), 1)
 
 if __name__ == '__main__':
     unittest.main()
