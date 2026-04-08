@@ -10,7 +10,7 @@ from pathlib import PurePath, Path
 from uuid import uuid1
 
 import sqlalchemy
-from sqlalchemy import select, text
+from sqlalchemy import select, text, desc
 
 from requests_toolbelt import MultipartEncoder
 
@@ -250,6 +250,46 @@ def migrate_stills(session):
 
     session.commit()
 
+def backfill_classify(session, limit=None, before=None, after=None):
+    from rq import Queue, Retry
+    from watcher.model import IntermediateResult
+
+    stmt = (
+        select(EventObservation)
+        .join(IntermediateResult, IntermediateResult.event_id == EventObservation.id)
+        .where(
+            EventObservation.id.notin_(
+                select(Labeling.event_id).where(Labeling.decider.like('ollama:%'))
+            )
+        )
+        .order_by(desc(EventObservation.capture_time))
+    )
+
+    if before:
+        stmt = stmt.where(EventObservation.capture_time < before)
+    if after:
+        stmt = stmt.where(EventObservation.capture_time > after)
+    if limit:
+        stmt = stmt.limit(limit)
+
+    events = session.execute(stmt).scalars().all()
+
+    classify_queue = Queue('classify_motion', connection=redis_connection())
+    count = 0
+    for event in events:
+        if not event.results:
+            continue
+        img_relpath = event.results[-1].file
+        classify_queue.enqueue(
+            'watcher.classify_motion.task_classify_motion',
+            args=(img_relpath, event.event_name),
+            retry=Retry(max=2, interval=5*60)
+        )
+        count += 1
+
+    print(f"Enqueued {count} events for classification")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Utilites for watcher')
     parser.add_argument('action', choices=[
@@ -261,6 +301,8 @@ def main():
         'ioworker',
         'videoworker',
         'predictionworker',
+        'classifyworker',
+        'backfill_classify',
         'singlevideo',
         'uncategorized',
         'requeue-failed',
@@ -270,7 +312,9 @@ def main():
         'pass'])
     parser.add_argument('-d', '--input_directory', type=pathlib.Path)
     parser.add_argument('-f', '--file', type=pathlib.Path)
-    parser.add_argument('-l', '--limit', type=int)
+    parser.add_argument('-n', '-l', '--limit', type=int, dest='limit', help='limit number of records to process')
+    parser.add_argument('--before', type=datetime.fromisoformat, help='only events before this datetime (ISO format)')
+    parser.add_argument('--after', type=datetime.fromisoformat, help='only events after this datetime (ISO format)')
     parser.add_argument('-u', '--set_user', help='generate a key for the given user, adding them if required')
     parser.add_argument('-D', '--debug', action='store_true')
     parser.add_argument('sub_args', nargs='*')
@@ -302,6 +346,11 @@ def main():
         elif args.action == 'predictionworker':
             import watcher.predict_still
             watcher.predict_still.run_prediction_queue()
+        elif args.action == 'classifyworker':
+            import watcher.classify_motion
+            watcher.classify_motion.run_classify_queue()
+        elif args.action == 'backfill_classify':
+            backfill_classify(session, limit=args.limit, before=args.before, after=args.after)
         elif args.action == 'uncategorized':
             uncategorized(session, limit=args.limit)
         elif args.action == 'singlevideo':

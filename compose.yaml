@@ -14,7 +14,7 @@ services:
     depends_on:
       - redis
     volumes:
-      - ./data:/data
+      - /data:/data
       - ./log:/var/log
     environment:
       - REDIS_URL=redis://redis
@@ -28,7 +28,7 @@ services:
     depends_on:
       - redis
     volumes:
-      - ./data:/data
+      - /data:/data
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
@@ -43,7 +43,7 @@ services:
     depends_on:
       - redis
     volumes:
-      - ./data:/data
+      - /data:/data
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
@@ -59,11 +59,30 @@ services:
     depends_on:
       - redis
     volumes:
-      - ./data:/data
+      - /data:/data
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
       - WATCHER_LOG_FILE=/var/log/watcher/predictor.log
+    restart: always
+
+  classifier:
+    profiles: ["predictor", "all"]
+    build:
+      context: .
+      dockerfile: Dockerfile-classifier
+    command: ./watchutil.py classifyworker
+    depends_on:
+      - redis
+    volumes:
+      - /data:/data
+      - ./log:/var/log
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
+      - WATCHER_LOG_FILE=/var/log/watcher/classifier.log
+      - WATCHER_CLASSIFICATION_OLLAMA_HOST=http://host.docker.internal:11434
     restart: always
    
   api:
@@ -73,7 +92,7 @@ services:
     profiles: ["web", "all"]
     command: uwsgi --ini /usr/local/etc/uwsgi.ini
     volumes:
-      - ./data:/data
+      - /data:/data
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
@@ -84,7 +103,7 @@ services:
     image: nginx
     profiles: ["web", "all"]
     volumes:
-     - ./data/video:/data/video:ro
+     - /data/video:/data/video:ro
      - ./etc/nginx:/etc/nginx:ro
     ports:
      - "80:80"

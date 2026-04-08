@@ -193,53 +193,65 @@ def task_save_significant_frame(name):
     if isinstance(name, list):
         name = name[0]
     
-    with TunneledConnection() as tc:
+    try:
+        with TunneledConnection() as tc:
 
-        session = sqlalchemy.orm.Session(tc)
+            session = sqlalchemy.orm.Session(tc)
 
-        result = {}
+            result = {}
 
-        vid = EventVideo(name=name, session=session)
+            vid = EventVideo(name=name, session=session)
 
-        logger.info(f"starting video analysis for {name} at {vid.file}")
+            logger.info(f"starting video analysis for {name} at {vid.file}")
 
-        #option 1 - frame by frame.
-        #sig_frame, num_frames, frame_img = find_sigificant_frame(str(vid.file))
+            #option 1 - frame by frame.
+            #sig_frame, num_frames, frame_img = find_sigificant_frame(str(vid.file))
 
-        #option 2 - read frames with ffmpeg, then work on them
-        sig_frame = vid.most_significant_frame()
-        num_frames = vid.num_frames
-        frame_img = vid.frames[sig_frame,:,:,:]
+            #option 2 - read frames with ffmpeg, then work on them
+            sig_frame = vid.most_significant_frame()
+            num_frames = vid.num_frames
+            frame_img = vid.frames[sig_frame,:,:,:]
 
-        result['most_significant_frame'] = sig_frame
-        result['number_of_frames'] = num_frames
-        result['duration'] = vid.duration
+            result['most_significant_frame'] = sig_frame
+            result['number_of_frames'] = num_frames
+            result['duration'] = vid.duration
 
-        img_relpath = Path(vid.event.video_location) / f"{name}_f{sig_frame}.jpg"
-        img = Image.fromarray(frame_img,mode='RGB')
+            img_relpath = Path(vid.event.video_location) / f"{name}_f{sig_frame}.jpg"
+            img = Image.fromarray(frame_img,mode='RGB')
 
-        ir = IntermediateResult(
-            computed_at = datetime.now(),
-            step = 'task_save_significant_frame',
-            file = str(img_relpath),
-            info = result,
-            event_id = vid.event.id
-        )
-        session.add(ir)
-        session.commit()
-        
-        io_queue = Queue('write_image', connection=redis_connection())
-        write_job = io_queue.enqueue(task_write_image, args=(img, str(img_relpath)), 
-                            retry=Retry(max=3, interval=5*60))
+            ir = IntermediateResult(
+                computed_at = datetime.now(),
+                step = 'task_save_significant_frame',
+                file = str(img_relpath),
+                info = result,
+                event_id = vid.event.id
+            )
+            session.add(ir)
+            session.commit()
+            
+            io_queue = Queue('write_image', connection=redis_connection())
+            write_job = io_queue.enqueue(task_write_image, args=(img, str(img_relpath)), 
+                                retry=Retry(max=3, interval=5*60))
 
-        logger.info(f"found frame {sig_frame} for {name}. Will store as {img_relpath}")
+            logger.info(f"found frame {sig_frame} for {name}. Will store as {img_relpath}")
 
-        predict_queue = Queue('prediction', connection=redis_connection())
-        job = predict_queue.enqueue('watcher.predict_still.task_predict_still', 
-                                    depends_on=write_job,
-                                    args=(str(img_relpath), name),
-                                    retry=Retry(max=1, interval=17*60))
-        logger.debug(f"enqueued prediction for {img_relpath} as {job.id}")
+            # fastai predictor disabled in favour of ollama classifier
+            # predict_queue = Queue('prediction', connection=redis_connection())
+            # job = predict_queue.enqueue('watcher.predict_still.task_predict_still',
+            #                             depends_on=write_job,
+            #                             args=(str(img_relpath), name),
+            #                             retry=Retry(max=1, interval=17*60))
+            # logger.debug(f"enqueued prediction for {img_relpath} as {job.id}")
+
+            classify_queue = Queue('classify_motion', connection=redis_connection())
+            job = classify_queue.enqueue('watcher.classify_motion.task_classify_motion',
+                                         depends_on=write_job,
+                                         args=(str(img_relpath), name),
+                                         retry=Retry(max=2, interval=5*60))
+            logger.debug(f"enqueued classification for {img_relpath} as {job.id}")
+            
+    except FFMPEGError as fe:
+        logger.error(f"FFMPEG error processing video {name}: {fe}")
 
 def run_video_queue(queues = ['event_video']):
     with TunneledConnection():
