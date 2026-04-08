@@ -252,11 +252,9 @@ def migrate_stills(session):
 
 def backfill_classify(session, limit=None, before=None, after=None):
     from rq import Queue, Retry
-    from watcher.model import IntermediateResult
 
     stmt = (
         select(EventObservation)
-        .join(IntermediateResult, IntermediateResult.event_id == EventObservation.id)
         .where(
             EventObservation.id.notin_(
                 select(Labeling.event_id).where(Labeling.decider.like('ollama:%'))
@@ -277,12 +275,9 @@ def backfill_classify(session, limit=None, before=None, after=None):
     classify_queue = Queue('classify_motion', connection=redis_connection())
     count = 0
     for event in events:
-        if not event.results:
-            continue
-        img_relpath = event.results[-1].file
         classify_queue.enqueue(
             'watcher.classify_motion.task_classify_motion',
-            args=(img_relpath, event.event_name),
+            args=(event.event_name,),
             retry=Retry(max=2, interval=5*60)
         )
         count += 1

@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import sqlalchemy
 from PIL import Image
 from rq import Queue, Retry, Worker
 
-from .connection import TunneledConnection, application_config, redis_connection, application_path_for
+from .connection import TunneledConnection, application_config, redis_connection
 from .model import EventObservation, Labeling
 
 from . import setup_logging
@@ -22,17 +23,10 @@ DEFAULT_OLLAMA_HOST = 'http://localhost:11434'
 DEFAULT_MODEL = 'moondream'
 MAX_IMAGE_WIDTH = 640
 
-CLASSIFICATION_PROMPT = """You are analyzing a security camera image. Classify the motion event.
+CLASSIFICATION_PROMPT = """Security camera image. Reply with only this JSON, no other text:
+{"category": "<person|vehicle|animal|lighting_change|wind_vegetation|shadow|unknown>", "interesting": <true|false>, "confidence": <0.0-1.0>}
 
-Respond with ONLY a JSON object, no other text:
-{
-  "category": "person" or "vehicle" or "animal" or "lighting_change" or "wind_vegetation" or "shadow" or "unknown",
-  "interesting": true if a person/vehicle/animal is clearly present, false if motion is environmental,
-  "confidence": a number from 0.0 to 1.0,
-  "description": "one brief sentence describing what you see"
-}
-
-Is there a distinct foreground subject (person, car, animal)? Or is the motion environmental (trees swaying, light changing, shadow moving)?"""
+interesting=true only if a person, vehicle, or animal is clearly visible."""
 
 
 def _ollama_host():
@@ -41,21 +35,71 @@ def _ollama_host():
 def _ollama_model():
     return application_config('classification', 'MODEL') or DEFAULT_MODEL
 
-def _encode_image(img_path: Path) -> str:
-    with Image.open(img_path) as img:
-        img.thumbnail((MAX_IMAGE_WIDTH, MAX_IMAGE_WIDTH))
-        buf = io.BytesIO()
-        img.save(buf, format='JPEG', quality=85)
-        return base64.b64encode(buf.getvalue()).decode('utf-8')
 
-def _query_ollama(img_path: Path) -> dict:
+def _frame_from_event(event) -> Image.Image:
+    """Return a PIL Image for the event.
+
+    Uses the saved significant-frame JPEG if it exists on disk.
+    Falls back to extracting the indexed frame (or a fixed timestamp)
+    directly from the MP4 using ffmpeg — no pre-extracted file required.
+    """
+    # Try the saved JPEG first
+    if event.results:
+        ir = event.results[-1]
+        from .connection import application_path_for
+        saved = application_path_for(ir.file)
+        if saved.exists():
+            return Image.open(saved)
+        # Use the stored frame index for extraction
+        frame_idx = (ir.info or {}).get('most_significant_frame')
+    else:
+        frame_idx = None
+
+    video_path = event.file_path
+    if not video_path.exists():
+        raise FileNotFoundError(f"video file {video_path} not found")
+
+    return _extract_frame(video_path, frame_idx)
+
+
+def _extract_frame(video_path: Path, frame_idx=None) -> Image.Image:
+    """Extract a single frame from an MP4 via ffmpeg subprocess."""
+    if frame_idx is not None:
+        # Select the exact frame by index (0-based)
+        vf = f'select=eq(n\\,{int(frame_idx)})'
+        cmd = ['ffmpeg', '-i', str(video_path),
+               '-vf', vf, '-vframes', '1',
+               '-f', 'image2pipe', '-vcodec', 'mjpeg', '-q:v', '3', 'pipe:1']
+    else:
+        # Fall back: grab frame ~2 seconds in
+        cmd = ['ffmpeg', '-ss', '2', '-i', str(video_path),
+               '-vframes', '1',
+               '-f', 'image2pipe', '-vcodec', 'mjpeg', '-q:v', '3', 'pipe:1']
+
+    result = subprocess.run(cmd, capture_output=True, timeout=30)
+    if result.returncode != 0 or not result.stdout:
+        raise RuntimeError(
+            f"ffmpeg failed extracting frame from {video_path}: "
+            f"{result.stderr.decode()[:300]}"
+        )
+    return Image.open(io.BytesIO(result.stdout))
+
+
+def _encode_pil(img: Image.Image) -> str:
+    img.thumbnail((MAX_IMAGE_WIDTH, MAX_IMAGE_WIDTH))
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=85)
+    return base64.b64encode(buf.getvalue()).decode('utf-8')
+
+
+def _query_ollama(img: Image.Image) -> dict:
     host = _ollama_host()
     model = _ollama_model()
 
     payload = {
         'model': model,
         'prompt': CLASSIFICATION_PROMPT,
-        'images': [_encode_image(img_path)],
+        'images': [_encode_pil(img)],
         'stream': False,
         'format': 'json',
     }
@@ -74,32 +118,33 @@ def _query_ollama(img_path: Path) -> dict:
         return {'category': 'unknown', 'interesting': False, 'confidence': 0.0, 'description': raw}
 
 
-def task_classify_motion(img_relpath: str, event_name: str):
-    img_path = application_path_for(img_relpath)
-    logger.debug(f"classifying {img_path} for {event_name}")
-
-    if not img_path.exists():
-        raise FileNotFoundError(f"image file {img_path} does not exist")
-
-    result = _query_ollama(img_path)
-
-    category = result.get('category', 'unknown')
-    interesting = result.get('interesting', False)
-    confidence = float(result.get('confidence', 0.0))
-    description = result.get('description', '')
-
-    logger.info(f"{event_name}: {category} interesting={interesting} conf={confidence:.2f} — {description}")
-
-    # Labels follow the existing convention: include 'noise' for environmental events
-    labels = [category]
-    if not interesting:
-        labels.append('noise')
+def task_classify_motion(event_name: str):
+    logger.debug(f"classifying {event_name}")
 
     with TunneledConnection() as tc:
         session = sqlalchemy.orm.Session(tc)
         event = EventObservation.by_name(session, event_name)
         if not event:
             raise ValueError(f"event {event_name} not found in database")
+
+        img = _frame_from_event(event)
+        result = _query_ollama(img)
+
+        category    = result.get('category', 'unknown')
+        # moondream sometimes returns interesting as a float — treat >0.5 as True
+        raw_interesting = result.get('interesting', False)
+        interesting = bool(raw_interesting) if isinstance(raw_interesting, bool) else float(raw_interesting) > 0.5
+        confidence  = float(result.get('confidence', 0.0))
+        description = result.get('description', '')
+
+        logger.info(
+            f"{event_name}: {category} interesting={interesting} "
+            f"conf={confidence:.2f} — {description}"
+        )
+
+        labels = [category]
+        if not interesting:
+            labels.append('noise')
 
         lbl = Labeling(
             event_id=event.id,

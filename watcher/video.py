@@ -245,10 +245,9 @@ def task_save_significant_frame(name):
 
             classify_queue = Queue('classify_motion', connection=redis_connection())
             job = classify_queue.enqueue('watcher.classify_motion.task_classify_motion',
-                                         depends_on=write_job,
-                                         args=(str(img_relpath), name),
+                                         args=(name,),
                                          retry=Retry(max=2, interval=5*60))
-            logger.debug(f"enqueued classification for {img_relpath} as {job.id}")
+            logger.debug(f"enqueued classification for {name} as {job.id}")
             
     except FFMPEGError as fe:
         logger.error(f"FFMPEG error processing video {name}: {fe}")

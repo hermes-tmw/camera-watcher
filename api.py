@@ -25,6 +25,7 @@ from watcher.model import *
 from watcher.connection import get_db_url, redis_connection
 from watcher.remote import APIUser
 from watcher.lite_tasks import task_record_event, task_write_image
+from watcher.browser import browser_bp
 
 from watcher import setup_logging, application_config
 
@@ -46,7 +47,8 @@ def create_app(db_url=None, db_options={}, testing=False) -> Flask:
         app.config['SQLALCHEMY_ENGINE_OPTIONS'] = db_options
         app.config['TESTING'] = testing
 
-        db.init_app(app) 
+        db.init_app(app)
+        app.register_blueprint(browser_bp)
         app.is_cli = False
 
         auth = HTTPBasicAuth()

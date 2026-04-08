@@ -1,6 +1,6 @@
 FROM python:3-bookworm
 
-RUN apt-get update && apt-get -y install sqlite3 redis
+RUN apt-get update && apt-get -y install sqlite3 redis ffmpeg
 
 WORKDIR /app
 COPY requirements-classifier.txt ./
