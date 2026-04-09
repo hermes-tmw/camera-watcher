@@ -11,7 +11,7 @@ services:
     build:
       dockerfile: Dockerfile-motion
     command: motion -n
-    user: "1000:1000"
+    user: "0:44"
     depends_on:
       - redis
     volumes:
@@ -26,6 +26,7 @@ services:
       context: .
       dockerfile: Dockerfile-io
     command: ./watchutil.py ioworker
+    user: "0:44"
     depends_on:
       - redis
     volumes:
@@ -42,6 +43,7 @@ services:
       context: .
       dockerfile: Dockerfile-video
     command: ./watchutil.py videoworker
+    user: "0:44"
     depends_on:
       - redis
     volumes:
@@ -76,6 +78,7 @@ services:
       context: .
       dockerfile: Dockerfile-classifier
     command: ./watchutil.py classifyworker
+    user: "0:44"
     depends_on:
       - redis
     volumes:
@@ -95,6 +98,7 @@ services:
       context: .
       dockerfile: Dockerfile-api
     profiles: ["web", "all"]
+    user: "0:44"
     command: uwsgi --ini /usr/local/etc/uwsgi.ini
     volumes:
       - /data/video:/data/video
