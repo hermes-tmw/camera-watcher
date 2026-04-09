@@ -12,17 +12,16 @@ import logging
 import sys
 from pathlib import Path
 
-logfile = Path('log/watcher/watcher.log')
 logname = 'watcher'
 logger = None
-    
+
 def setup_logging():
     global logger
 
     if logger != None:
         return logger
 
-    log_level = application_config('log', 'LEVEL').upper()
+    log_level = (application_config('log', 'LEVEL') or 'INFO').upper()
     assert log_level in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], f"invalid log level {log_level}"
 
     logger = logging.getLogger(logname)
@@ -32,18 +31,19 @@ def setup_logging():
 
     consoleHandler = logging.StreamHandler()
     consoleHandler.setLevel(log_level)
-    #consoleHandler.setFormatter(formatter)
     consoleHandler.setStream(sys.stdout)
-
-    if not logfile.parent.exists():
-        logfile.parent.mkdir(parents=True, exist_ok=True)
-
-    fileHandler = logging.FileHandler(logfile)
-    fileHandler.setLevel(log_level)
-    fileHandler.setFormatter(formatter)
-
     logger.addHandler(consoleHandler)
-    logger.addHandler(fileHandler)
+
+    log_path = application_config('log', 'FILE') or 'log/watcher/watcher.log'
+    logfile = Path(log_path)
+    try:
+        logfile.parent.mkdir(parents=True, exist_ok=True)
+        fileHandler = logging.FileHandler(logfile)
+        fileHandler.setLevel(log_level)
+        fileHandler.setFormatter(formatter)
+        logger.addHandler(fileHandler)
+    except OSError:
+        logger.warning(f"Could not open log file {logfile}, logging to stdout only")
 
     return logger
 
