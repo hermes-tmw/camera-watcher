@@ -181,11 +181,12 @@ def batch_sync_to_remote(session):
         logger.info(f"{resp.status_code} upload complete")
 
 def enqueue_event(session, event_names):
+    from rq import Retry
     from watcher.video import task_save_significant_frame
 
-    for name in event_names: 
-        queue = Queue(connection=redis_connection(),name='event_video')
-        queue.enqueue(task_save_significant_frame,name)
+    for name in event_names:
+        queue = Queue(connection=redis_connection(), name='event_video')
+        queue.enqueue(task_save_significant_frame, name, retry=Retry(max=1, interval=5*60))
 
 def show_failed(sub_args=None):
     queue = Queue(connection=redis_connection())

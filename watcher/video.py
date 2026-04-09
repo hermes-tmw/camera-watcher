@@ -250,7 +250,13 @@ def task_save_significant_frame(name):
             logger.debug(f"enqueued classification for {name} as {job.id}")
             
     except FFMPEGError as fe:
-        logger.error(f"FFMPEG error processing video {name}: {fe}")
+        from rq.job import get_current_job
+        job = get_current_job()
+        retries_left = job.retries_left if job else 0
+        if retries_left and retries_left > 0:
+            logger.warning(f"FFMPEG error for {name}, will retry: {fe}")
+            raise
+        logger.warning(f"FFMPEG error for {name} after retries, skipping: {fe}")
 
 def run_video_queue(queues = ['event_video']):
     with TunneledConnection():
