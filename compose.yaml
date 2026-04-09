@@ -11,24 +11,26 @@ services:
     build:
       dockerfile: Dockerfile-motion
     command: motion -n
+    user: "1000:1000"
     depends_on:
       - redis
     volumes:
-      - /data:/data
+      - /data/video:/data/video
       - ./log:/var/log
     environment:
       - REDIS_URL=redis://redis
     restart: always
 
   io:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile-io
     command: ./watchutil.py ioworker
     depends_on:
       - redis
     volumes:
-      - /data:/data
+      - /data/video:/data/video
+      - /data/watcher.sqlite3:/data/watcher.sqlite3
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
@@ -43,7 +45,8 @@ services:
     depends_on:
       - redis
     volumes:
-      - /data:/data
+      - /data/video:/data/video
+      - /data/watcher.sqlite3:/data/watcher.sqlite3
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
@@ -59,7 +62,8 @@ services:
     depends_on:
       - redis
     volumes:
-      - /data:/data
+      - /data/video:/data/video
+      - /data/watcher.sqlite3:/data/watcher.sqlite3
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
@@ -75,7 +79,8 @@ services:
     depends_on:
       - redis
     volumes:
-      - /data:/data
+      - /data/video:/data/video
+      - /data/watcher.sqlite3:/data/watcher.sqlite3
       - ./log:/var/log
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -84,21 +89,22 @@ services:
       - WATCHER_LOG_FILE=/var/log/watcher/classifier.log
       - WATCHER_CLASSIFICATION_OLLAMA_HOST=http://host.docker.internal:11434
     restart: always
-   
+
   api:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile-api
     profiles: ["web", "all"]
     command: uwsgi --ini /usr/local/etc/uwsgi.ini
     volumes:
-      - /data:/data
+      - /data/video:/data/video
+      - /data/watcher.sqlite3:/data/watcher.sqlite3
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
       - WATCHER_LOG_FILE=/var/log/watcher/api.log
     restart: always
-    
+
   web:
     image: nginx
     profiles: ["web", "all"]
