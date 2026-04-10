@@ -105,7 +105,7 @@ def _query_ollama(img: Image.Image, model: str = None) -> dict:
     }
 
     try:
-        resp = requests.post(f'{host}/api/generate', json=payload, timeout=90)
+        resp = requests.post(f'{host}/api/generate', json=payload, timeout=180)
         resp.raise_for_status()
     except requests.exceptions.ConnectionError as e:
         raise ConnectionError(f"Could not reach Ollama at {host}: {e}") from e

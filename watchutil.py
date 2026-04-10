@@ -274,8 +274,16 @@ def backfill_classify(session, limit=None, before=None, after=None, model=None, 
     events = session.execute(stmt).scalars().all()
 
     classify_queue = Queue('classify_motion', connection=redis_connection())
-    count = 0
+    count = skipped = 0
     for event in events:
+        # Skip events with no accessible video or saved frame
+        has_frame = event.results and any(
+            application_path_for(r.file).exists() for r in event.results
+        )
+        if not has_frame and not event.file_path.exists():
+            skipped += 1
+            continue
+
         args = (event.event_name,) if not model else (event.event_name, model)
         classify_queue.enqueue(
             'watcher.classify_motion.task_classify_motion',
@@ -285,7 +293,7 @@ def backfill_classify(session, limit=None, before=None, after=None, model=None, 
         count += 1
 
     model_str = f" with {model}" if model else ""
-    print(f"Enqueued {count} events for classification{model_str}")
+    print(f"Enqueued {count} events for classification{model_str} (skipped {skipped} with no video)")
 
 
 def main():
