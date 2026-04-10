@@ -29,8 +29,6 @@ DEST_BASE = Path('/data/video/watcher')
 SOURCES = [
     # Top-level NFS directories that are camera sites
     (Path('/data/video/gopro'),           'gopro'),
-    (Path('/data/video/wildlife'),        'wildlife'),
-    (Path('/data/video/road use'),        'road use'),
     # wichitaDriveway from two sources — both merge into same destination
     (Path('/data/video/wichitaDriveway'), 'wichitaDriveway'),
     (Path('/data/video_local/wichitaDriveway'), 'wichitaDriveway'),
