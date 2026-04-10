@@ -6,3 +6,4 @@ pytz
 astral
 requests
 pillow
+psycopg2-binary

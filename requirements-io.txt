@@ -11,3 +11,4 @@ requests-toolbelt>=0.9.1
 pytz
 pyuwsgi
 pillow
+psycopg2-binary

@@ -99,7 +99,7 @@ def get_db_config():
         'db_user': get_config_val(config,'DB_USER'),
         'db_pass': get_config_val(config,'DB_PASS'),
         'db_name': get_config_val(config,'DB_NAME'),
-        'db_port': int(get_config_val(config,'DB_PORT',3306)),
+        'db_port': int(get_config_val(config,'DB_PORT', 5432 if 'postgresql' in get_config_val(config,'DB_DRIVER','') else 3306)),
 
         'db_ssh_host': get_config_val(config,"DB_SSH_HOST"),
         'db_ssh_user': get_config_val(config,"DB_SSH_USER"),
@@ -152,8 +152,10 @@ class TunneledConnection(object):
         return self._session
 
     def disconnect(self):
-        self._session.remove()
-        self.connection.close()
+        if self._session:
+            self._session.remove()
+        if self.connection:
+            self.connection.close()
         if self.tunnel and self.tunnel.is_active:
             self.tunnel.close()
 

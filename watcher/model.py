@@ -30,7 +30,7 @@ class EventObservation(WatcherBase):
     __tablename__ = 'event_observations'
     
     id: Mapped[int] = mapped_column(primary_key=True)
-    event_name: Mapped[str] = mapped_column()
+    event_name: Mapped[str] = mapped_column(unique=True)
     video_file: Mapped[str] = mapped_column()
     capture_time: Mapped[datetime] = mapped_column()
     scene_name: Mapped[str] = mapped_column()
