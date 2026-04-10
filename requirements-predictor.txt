@@ -4,4 +4,5 @@ redis
 rq>=2.7.0
 pytz
 pillow
-fastaipsycopg2-binary
+fastai
+psycopg2-binary
