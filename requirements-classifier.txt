@@ -5,7 +5,7 @@ Flask-HTTPAuth>=4.5.0
 astral
 requests
 redis
-rq>=1.15.1
+rq>=2.7.0
 requests-toolbelt>=0.9.1
 pytz
 pillow
