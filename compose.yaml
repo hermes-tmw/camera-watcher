@@ -16,6 +16,7 @@ services:
       - redis
     volumes:
       - /data/video:/data/video
+      - ./etc:/usr/local/etc:ro
       - ./log:/var/log
     environment:
       - REDIS_URL=redis://redis
@@ -31,7 +32,7 @@ services:
       - redis
     volumes:
       - /data/video:/data/video
-      - /data/watcher.sqlite3:/data/watcher.sqlite3
+      - ./etc:/usr/local/etc:ro
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
@@ -48,7 +49,7 @@ services:
       - redis
     volumes:
       - /data/video:/data/video
-      - /data/watcher.sqlite3:/data/watcher.sqlite3
+      - ./etc:/usr/local/etc:ro
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
@@ -65,7 +66,7 @@ services:
       - redis
     volumes:
       - /data/video:/data/video
-      - /data/watcher.sqlite3:/data/watcher.sqlite3
+      - ./etc:/usr/local/etc:ro
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
@@ -83,7 +84,7 @@ services:
       - redis
     volumes:
       - /data/video:/data/video
-      - /data/watcher.sqlite3:/data/watcher.sqlite3
+      - ./etc:/usr/local/etc:ro
       - ./log:/var/log
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -102,7 +103,7 @@ services:
     command: uwsgi --ini /usr/local/etc/uwsgi.ini
     volumes:
       - /data/video:/data/video
-      - /data/watcher.sqlite3:/data/watcher.sqlite3
+      - ./etc:/usr/local/etc:ro
       - ./log:/var/log
     environment:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg

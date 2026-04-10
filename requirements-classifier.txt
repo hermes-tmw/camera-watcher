@@ -1,9 +1,12 @@
-sqlalchemy>=2.0.12
+flask_sqlalchemy
 sshtunnel
-redis
-rq>=1.15.1
-pytz
+passlib>=1.7.4
+Flask-HTTPAuth>=4.5.0
 astral
 requests
+redis
+rq>=1.15.1
+requests-toolbelt>=0.9.1
+pytz
 pillow
 psycopg2-binary

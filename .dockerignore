@@ -1,0 +1,9 @@
+log/
+data/
+*.sqlite3
+*.pyc
+__pycache__
+.git
+*.ipynb
+nbs/
+models/
