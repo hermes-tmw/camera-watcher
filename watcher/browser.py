@@ -195,7 +195,24 @@ def events_json():
     from api import db
 
     filter_mode = request.args.get('filter', 'recent')
-    page = request.args.get('page', 1, type=int)
+    page        = request.args.get('page', 1, type=int)
+    since_id    = request.args.get('since_id', type=int)   # newer events only
+    ids         = request.args.getlist('id', type=int)      # re-fetch specific events
+
+    if ids:
+        # Re-fetch specific events by id (for badge refresh)
+        stmt = (_base_stmt()
+                .where(EventObservation.id.in_(ids)))
+        rows = db.session.execute(stmt).scalars().unique().all()
+        return jsonify({'events': [_serialize(e) for e in rows]})
+
+    if since_id is not None:
+        # New events only — ignore pagination, just return what arrived since last poll
+        stmt = (_base_stmt()
+                .where(EventObservation.capture_time >= _recent_cutoff())
+                .where(EventObservation.id > since_id))
+        rows = db.session.execute(stmt).scalars().unique().all()
+        return jsonify({'events': [_serialize(e) for e in rows]})
 
     events, has_more = _fetch(db.session, page, filter_mode)
     return jsonify({'events': events, 'has_more': has_more, 'page': page})
@@ -251,7 +268,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
   {% elif ml and not ml.interesting %}{% set border = 'border-l-slate-300' %}
   {% else %}{% set border = 'border-l-amber-300' %}{% endif %}
 
-  <div class="event-card bg-white rounded-xl shadow-sm flex overflow-hidden border border-slate-200 border-l-4 {{ border }}">
+  <div class="event-card bg-white rounded-xl shadow-sm flex overflow-hidden border border-slate-200 border-l-4 {{ border }}"
+       data-id="{{ ev.id }}" data-classified="{{ '1' if ml else '0' }}">
 
     <div class="card-thumb flex-shrink-0">
       {% if ev.frame_url %}
@@ -279,16 +297,16 @@ _TEMPLATE = r"""<!DOCTYPE html>
         {% if ml %}
           {% set icon = CATEGORY_ICON.get(ml.category, '❓') %}
           {% if ml.interesting %}
-          <span class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-semibold bg-green-100 text-green-800">
+          <span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-semibold bg-green-100 text-green-800">
             {{ icon }} {{ ml.category | replace('_',' ') | title }}{% if ml.confidence %} · {{ ml.confidence }}%{% endif %}
           </span>
           {% else %}
-          <span class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-500">
+          <span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-500">
             {{ icon }} {{ ml.category | replace('_',' ') }}{% if ml.confidence %} {{ ml.confidence }}%{% endif %}
           </span>
           {% endif %}
         {% else %}
-          <span class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-amber-100 text-amber-700">unclassified</span>
+          <span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-amber-100 text-amber-700">unclassified</span>
         {% endif %}
       </div>
 
@@ -328,12 +346,12 @@ const CATEGORY_ICON = {{ CATEGORY_ICON | tojson }};
 const LIGHTING_LABEL = {{ LIGHTING_LABEL | tojson }};
 
 function badge(ml) {
-  if (!ml) return '<span class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-amber-100 text-amber-700">unclassified</span>';
+  if (!ml) return '<span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-amber-100 text-amber-700">unclassified</span>';
   const icon = CATEGORY_ICON[ml.category] || '❓';
   const conf = ml.confidence ? ` · ${ml.confidence}%` : '';
   if (ml.interesting)
-    return `<span class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-semibold bg-green-100 text-green-800">${icon} ${ml.category.replace(/_/g,' ')}${conf}</span>`;
-  return `<span class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-500">${icon} ${ml.category.replace(/_/g,' ')}${conf}</span>`;
+    return `<span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-semibold bg-green-100 text-green-800">${icon} ${ml.category.replace(/_/g,' ')}${conf}</span>`;
+  return `<span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-500">${icon} ${ml.category.replace(/_/g,' ')}${conf}</span>`;
 }
 
 function renderCard(ev) {
@@ -347,7 +365,8 @@ function renderCard(ev) {
     ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${ev.human.labels.map(l=>`<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#dbeafe;color:#1d4ed8">${l}</span>`).join('')}</div>`
     : '';
   return `
-    <div class="event-card bg-white rounded-xl shadow-sm flex overflow-hidden border border-slate-200 border-l-4 ${border}">
+    <div class="event-card bg-white rounded-xl shadow-sm flex overflow-hidden border border-slate-200 border-l-4 ${border}"
+         data-id="${ev.id}" data-classified="${ml ? 1 : 0}">
       <div class="card-thumb flex-shrink-0">${thumb}</div>
       <div class="p-4 flex-1 flex flex-col gap-1 min-w-0">
         <div class="flex items-start justify-between gap-2 flex-wrap">
@@ -362,6 +381,61 @@ function renderCard(ev) {
       </div>
     </div>`;
 }
+
+// ── auto-refresh ─────────────────────────────────────────────────────────────
+
+const POLL_INTERVAL = 30_000; // ms
+const activeFilter = new URLSearchParams(location.search).get('filter') || 'recent';
+
+// Seed maxId from server-rendered cards
+let maxId = 0;
+document.querySelectorAll('.event-card[data-id]').forEach(el => {
+  maxId = Math.max(maxId, parseInt(el.dataset.id));
+});
+
+function getUnclassifiedIds() {
+  return Array.from(document.querySelectorAll('.event-card[data-id][data-classified="0"]'))
+              .map(el => parseInt(el.dataset.id));
+}
+
+async function poll() {
+  try {
+    // 1. Fetch any events newer than what we have
+    const newResp = await fetch(`/events?filter=${activeFilter}&since_id=${maxId}`);
+    const newData = await newResp.json();
+    if (newData.events.length) {
+      const list = document.getElementById('event-list');
+      newData.events.forEach(ev => {
+        list.insertAdjacentHTML('afterbegin', renderCard(ev));
+        maxId = Math.max(maxId, ev.id);
+      });
+    }
+
+    // 2. Re-fetch unclassified cards to see if labels have arrived
+    const pendingIds = getUnclassifiedIds();
+    if (pendingIds.length) {
+      const qs = pendingIds.map(id => `id=${id}`).join('&');
+      const updResp = await fetch(`/events?${qs}`);
+      const updData = await updResp.json();
+      updData.events.forEach(ev => {
+        if (!ev.ml) return; // still unclassified
+        const card = document.querySelector(`.event-card[data-id="${ev.id}"]`);
+        if (!card) return;
+        // Swap badge and border
+        const badgeEl = card.querySelector('[data-badge]');
+        if (badgeEl) badgeEl.outerHTML = badge(ev.ml);
+        const border = ev.ml.interesting ? 'border-l-green-400' : 'border-l-slate-300';
+        card.classList.remove('border-l-amber-300', 'border-l-green-400', 'border-l-slate-300');
+        card.classList.add(border);
+        card.dataset.classified = '1';
+      });
+    }
+  } catch(e) { /* network hiccup — try again next interval */ }
+}
+
+setInterval(poll, POLL_INTERVAL);
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 document.getElementById('load-more-btn')?.addEventListener('click', async function() {
   const btn = this;
