@@ -268,62 +268,66 @@ _TEMPLATE = r"""<!DOCTYPE html>
   {% elif ml and not ml.interesting %}{% set border = 'border-l-slate-300' %}
   {% else %}{% set border = 'border-l-amber-300' %}{% endif %}
 
-  <div class="event-card bg-white rounded-xl shadow-sm flex overflow-hidden border border-slate-200 border-l-4 {{ border }}"
-       data-id="{{ ev.id }}" data-classified="{{ '1' if ml else '0' }}">
+  <div class="event-card bg-white rounded-xl shadow-sm flex flex-col overflow-hidden border border-slate-200 border-l-4 {{ border }}"
+       data-id="{{ ev.id }}" data-classified="{{ '1' if ml else '0' }}" data-video="{{ ev.video_url }}">
 
-    <div class="card-thumb flex-shrink-0">
-      {% if ev.frame_url %}
-      <a href="{{ ev.video_url }}" target="_blank" title="Watch video">
+    <div class="flex">
+      <div class="card-thumb flex-shrink-0 cursor-pointer" onclick="toggleVideo(this.closest('.event-card'))">
+        {% if ev.frame_url %}
         <img src="{{ ev.frame_url }}" alt="frame" loading="lazy"
              onerror="this.closest('.card-thumb').innerHTML='<div class=\'flex items-center justify-center h-full text-slate-400 text-xs p-2\'>no frame</div>'">
-      </a>
-      {% else %}
-      <a href="{{ ev.video_url }}" target="_blank"
-         class="flex items-center justify-center h-full text-slate-400 text-xs p-2 hover:bg-slate-100">
-        ▶ video
-      </a>
-      {% endif %}
-    </div>
-
-    <div class="p-4 flex-1 flex flex-col gap-1 min-w-0">
-      <div class="flex items-start justify-between gap-2 flex-wrap">
-        <div>
-          <div class="font-medium text-sm">{{ ev.capture_time }}</div>
-          <div class="text-xs text-slate-400 mt-0.5">
-            {{ ev.scene_name }}{% if ev.lighting %} · {{ LIGHTING_LABEL.get(ev.lighting,'') }} {{ ev.lighting }}{% endif %}
-          </div>
-        </div>
-
-        {% if ml %}
-          {% set icon = CATEGORY_ICON.get(ml.category, '❓') %}
-          {% if ml.interesting %}
-          <span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-semibold bg-green-100 text-green-800">
-            {{ icon }} {{ ml.category | replace('_',' ') | title }}{% if ml.confidence %} · {{ ml.confidence }}%{% endif %}
-          </span>
-          {% else %}
-          <span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-500">
-            {{ icon }} {{ ml.category | replace('_',' ') }}{% if ml.confidence %} {{ ml.confidence }}%{% endif %}
-          </span>
-          {% endif %}
         {% else %}
-          <span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-amber-100 text-amber-700">unclassified</span>
+        <div class="flex items-center justify-center h-full text-slate-400 text-xs p-2">▶ video</div>
         {% endif %}
       </div>
 
-      {% if ev.human %}
-      <div class="flex items-center gap-1 flex-wrap mt-1">
-        <span class="text-xs text-slate-400">Human:</span>
-        {% for lbl in ev.human.labels %}
-        <span class="px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 text-xs">{{ lbl }}</span>
-        {% endfor %}
-      </div>
-      {% endif %}
+      <div class="p-4 flex-1 flex flex-col gap-1 min-w-0">
+        <div class="flex items-start justify-between gap-2 flex-wrap">
+          <div>
+            <div class="font-medium text-sm">{{ ev.capture_time }}</div>
+            <div class="text-xs text-slate-400 mt-0.5">
+              {{ ev.scene_name }}{% if ev.lighting %} · {{ LIGHTING_LABEL.get(ev.lighting,'') }} {{ ev.lighting }}{% endif %}
+            </div>
+          </div>
 
-      <a href="{{ ev.video_url }}" target="_blank"
-         class="mt-auto pt-2 text-xs text-blue-500 hover:text-blue-700 hover:underline w-fit">
-        ▶ Watch clip
-      </a>
+          {% if ml %}
+            {% set icon = CATEGORY_ICON.get(ml.category, '❓') %}
+            {% if ml.interesting %}
+            <span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-semibold bg-green-100 text-green-800">
+              {{ icon }} {{ ml.category | replace('_',' ') | title }}{% if ml.confidence %} · {{ ml.confidence }}%{% endif %}
+            </span>
+            {% else %}
+            <span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-500">
+              {{ icon }} {{ ml.category | replace('_',' ') }}{% if ml.confidence %} {{ ml.confidence }}%{% endif %}
+            </span>
+            {% endif %}
+          {% else %}
+            <span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-amber-100 text-amber-700">unclassified</span>
+          {% endif %}
+        </div>
+
+        {% if ev.human %}
+        <div class="flex items-center gap-1 flex-wrap mt-1">
+          <span class="text-xs text-slate-400">Human:</span>
+          {% for lbl in ev.human.labels %}
+          <span class="px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 text-xs">{{ lbl }}</span>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        <button onclick="toggleVideo(this.closest('.event-card'))"
+                class="mt-auto pt-2 text-xs text-blue-500 hover:text-blue-700 hover:underline w-fit text-left">
+          ▶ Watch clip
+        </button>
+      </div>
     </div>
+
+    <div class="video-player hidden">
+      <video controls playsinline style="width:100%;display:block;max-height:400px;background:#000">
+        <source src="{{ ev.video_url }}" type="video/mp4">
+      </video>
+    </div>
+
   </div>
   {% else %}
   <div class="text-center text-slate-400 py-16">No events found.</div>
@@ -365,21 +369,43 @@ function renderCard(ev) {
     ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${ev.human.labels.map(l=>`<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#dbeafe;color:#1d4ed8">${l}</span>`).join('')}</div>`
     : '';
   return `
-    <div class="event-card bg-white rounded-xl shadow-sm flex overflow-hidden border border-slate-200 border-l-4 ${border}"
-         data-id="${ev.id}" data-classified="${ml ? 1 : 0}">
-      <div class="card-thumb flex-shrink-0">${thumb}</div>
-      <div class="p-4 flex-1 flex flex-col gap-1 min-w-0">
-        <div class="flex items-start justify-between gap-2 flex-wrap">
-          <div>
-            <div class="font-medium text-sm">${ev.capture_time}</div>
-            <div class="text-xs text-slate-400 mt-0.5">${ev.scene_name}${lighting}</div>
+    <div class="event-card bg-white rounded-xl shadow-sm flex flex-col overflow-hidden border border-slate-200 border-l-4 ${border}"
+         data-id="${ev.id}" data-classified="${ml ? 1 : 0}" data-video="${ev.video_url}">
+      <div class="flex">
+        <div class="card-thumb flex-shrink-0 cursor-pointer" onclick="toggleVideo(this.closest('.event-card'))">${thumb}</div>
+        <div class="p-4 flex-1 flex flex-col gap-1 min-w-0">
+          <div class="flex items-start justify-between gap-2 flex-wrap">
+            <div>
+              <div class="font-medium text-sm">${ev.capture_time}</div>
+              <div class="text-xs text-slate-400 mt-0.5">${ev.scene_name}${lighting}</div>
+            </div>
+            ${badge(ml)}
           </div>
-          ${badge(ml)}
+          ${human}
+          <button onclick="toggleVideo(this.closest('.event-card'))" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">▶ Watch clip</button>
         </div>
-        ${human}
-        <a href="${ev.video_url}" target="_blank" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit">▶ Watch clip</a>
+      </div>
+      <div class="video-player hidden">
+        <video controls playsinline style="width:100%;display:block;max-height:400px;background:#000">
+          <source src="${ev.video_url}" type="video/mp4">
+        </video>
       </div>
     </div>`;
+}
+
+// ── inline video player ───────────────────────────────────────────────────────
+
+function toggleVideo(card) {
+  const player = card.querySelector('.video-player');
+  const video  = card.querySelector('video');
+  if (player.classList.contains('hidden')) {
+    player.classList.remove('hidden');
+    video.play();
+  } else {
+    video.pause();
+    video.currentTime = 0;
+    player.classList.add('hidden');
+  }
 }
 
 // ── auto-refresh ─────────────────────────────────────────────────────────────
