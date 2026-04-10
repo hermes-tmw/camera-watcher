@@ -251,18 +251,18 @@ def migrate_stills(session):
 
     session.commit()
 
-def backfill_classify(session, limit=None, before=None, after=None):
+def backfill_classify(session, limit=None, before=None, after=None, model=None, reclassify=False):
     from rq import Queue, Retry
 
-    stmt = (
-        select(EventObservation)
-        .where(
-            EventObservation.id.notin_(
-                select(Labeling.event_id).where(Labeling.decider.like('ollama:%'))
-            )
-        )
-        .order_by(desc(EventObservation.capture_time))
-    )
+    stmt = select(EventObservation).order_by(desc(EventObservation.capture_time))
+
+    if reclassify:
+        # Only re-run events that already have an ollama label
+        already_classified = select(Labeling.event_id).where(Labeling.decider.like('ollama:%'))
+        stmt = stmt.where(EventObservation.id.in_(already_classified))
+    else:
+        already_classified = select(Labeling.event_id).where(Labeling.decider.like('ollama:%'))
+        stmt = stmt.where(EventObservation.id.notin_(already_classified))
 
     if before:
         stmt = stmt.where(EventObservation.capture_time < before)
@@ -276,14 +276,16 @@ def backfill_classify(session, limit=None, before=None, after=None):
     classify_queue = Queue('classify_motion', connection=redis_connection())
     count = 0
     for event in events:
+        args = (event.event_name,) if not model else (event.event_name, model)
         classify_queue.enqueue(
             'watcher.classify_motion.task_classify_motion',
-            args=(event.event_name,),
+            args=args,
             retry=Retry(max=2, interval=5*60)
         )
         count += 1
 
-    print(f"Enqueued {count} events for classification")
+    model_str = f" with {model}" if model else ""
+    print(f"Enqueued {count} events for classification{model_str}")
 
 
 def main():
@@ -311,6 +313,8 @@ def main():
     parser.add_argument('-n', '-l', '--limit', type=int, dest='limit', help='limit number of records to process')
     parser.add_argument('--before', type=datetime.fromisoformat, help='only events before this datetime (ISO format)')
     parser.add_argument('--after', type=datetime.fromisoformat, help='only events after this datetime (ISO format)')
+    parser.add_argument('-m', '--model', help='ollama model to use for classification (e.g. llama3.2-vision:latest)')
+    parser.add_argument('--reclassify', action='store_true', help='re-classify events that already have an ollama label')
     parser.add_argument('-u', '--set_user', help='generate a key for the given user, adding them if required')
     parser.add_argument('-D', '--debug', action='store_true')
     parser.add_argument('sub_args', nargs='*')
@@ -346,7 +350,8 @@ def main():
             import watcher.classify_motion
             watcher.classify_motion.run_classify_queue()
         elif args.action == 'backfill_classify':
-            backfill_classify(session, limit=args.limit, before=args.before, after=args.after)
+            backfill_classify(session, limit=args.limit, before=args.before, after=args.after,
+                              model=args.model, reclassify=args.reclassify)
         elif args.action == 'uncategorized':
             uncategorized(session, limit=args.limit)
         elif args.action == 'singlevideo':

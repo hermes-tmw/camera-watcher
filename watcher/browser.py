@@ -52,7 +52,9 @@ def _fmt_time(dt):
 
 
 def _ml_info(event):
-    lbl = next((l for l in event.labelings if l.decider and l.decider.startswith('ollama:')), None)
+    # Use the most recently decided ollama labeling (highest id)
+    ollama = [l for l in event.labelings if l.decider and l.decider.startswith('ollama:')]
+    lbl = max(ollama, key=lambda l: l.id) if ollama else None
     if not lbl:
         return None
     cats = [l for l in lbl.labels if l != 'noise']

@@ -92,9 +92,9 @@ def _encode_pil(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
 
-def _query_ollama(img: Image.Image) -> dict:
+def _query_ollama(img: Image.Image, model: str = None) -> dict:
     host = _ollama_host()
-    model = _ollama_model()
+    model = model or _ollama_model()
 
     payload = {
         'model': model,
@@ -118,8 +118,9 @@ def _query_ollama(img: Image.Image) -> dict:
         return {'category': 'unknown', 'interesting': False, 'confidence': 0.0, 'description': raw}
 
 
-def task_classify_motion(event_name: str):
-    logger.debug(f"classifying {event_name}")
+def task_classify_motion(event_name: str, model: str = None):
+    model = model or _ollama_model()
+    logger.debug(f"classifying {event_name} with {model}")
 
     with TunneledConnection() as tc:
         session = sqlalchemy.orm.Session(tc)
@@ -128,7 +129,7 @@ def task_classify_motion(event_name: str):
             raise ValueError(f"event {event_name} not found in database")
 
         img = _frame_from_event(event)
-        result = _query_ollama(img)
+        result = _query_ollama(img, model=model)
 
         category    = result.get('category', 'unknown')
         # moondream sometimes returns interesting as a float — treat >0.5 as True
@@ -139,7 +140,7 @@ def task_classify_motion(event_name: str):
 
         logger.info(
             f"{event_name}: {category} interesting={interesting} "
-            f"conf={confidence:.2f} — {description}"
+            f"conf={confidence:.2f} [{model}]"
         )
 
         labels = [category]
@@ -148,7 +149,7 @@ def task_classify_motion(event_name: str):
 
         lbl = Labeling(
             event_id=event.id,
-            decider=f'ollama:{_ollama_model()}',
+            decider=f'ollama:{model}',
             decided_at=datetime.now(),
             labels=labels,
             probabilities=[confidence],
