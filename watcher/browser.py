@@ -1,11 +1,11 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytz
 from flask import Blueprint, render_template_string, request, jsonify
-from sqlalchemy import select, desc, func
+from sqlalchemy import select, desc, func, exists, Text
 from sqlalchemy.orm import joinedload
 
-from .model import EventObservation, Labeling
+from .model import EventObservation, Labeling, IntermediateResult
 from .connection import application_config
 
 __all__ = ['browser_bp']
@@ -13,6 +13,8 @@ __all__ = ['browser_bp']
 browser_bp = Blueprint('browser', __name__)
 
 PAGE_SIZE = 24
+RECENT_DAYS = 60   # "recent" filter window
+
 
 CATEGORY_ICON = {
     'person':           '🚶',
@@ -44,7 +46,9 @@ def _fmt_time(dt):
         local = dt.astimezone(_tz())
     except Exception:
         local = dt
-    return local.strftime('%b %-d, %Y  %-I:%M %p')
+    # strftime %-I is Linux-only; strip manually for portability
+    s = local.strftime('%b %d, %Y  %I:%M %p').lstrip('0')
+    return s.replace('  0', '  ').replace(' 0', ' ')
 
 
 def _ml_info(event):
@@ -82,25 +86,50 @@ def _serialize(event):
     }
 
 
-def _fetch(db_session, page, filter_mode):
-    stmt = (select(EventObservation)
+def _recent_cutoff():
+    return datetime.now(timezone.utc) - timedelta(days=RECENT_DAYS)
+
+
+def _base_stmt():
+    return (select(EventObservation)
             .options(joinedload(EventObservation.labelings),
                      joinedload(EventObservation.results))
             .order_by(desc(EventObservation.capture_time)))
 
-    if filter_mode == 'interesting':
+
+def _has_frame_subq():
+    return select(IntermediateResult.event_id).correlate(EventObservation)
+
+
+def _fetch(db_session, page, filter_mode):
+    stmt = _base_stmt()
+
+    if filter_mode == 'recent':
+        stmt = stmt.where(EventObservation.capture_time >= _recent_cutoff())
+
+    elif filter_mode == 'interesting':
         ids = (select(Labeling.event_id)
                .where(Labeling.decider.like('ollama:%'))
-               .where(Labeling.labels.not_like('%noise%')))
+               .where(Labeling.labels.cast(Text).not_like('%noise%')))
         stmt = stmt.where(EventObservation.id.in_(ids))
+
     elif filter_mode == 'noise':
         ids = (select(Labeling.event_id)
                .where(Labeling.decider.like('ollama:%'))
-               .where(Labeling.labels.like('%noise%')))
+               .where(Labeling.labels.cast(Text).like('%noise%')))
         stmt = stmt.where(EventObservation.id.in_(ids))
+
     elif filter_mode == 'unclassified':
         classified = select(Labeling.event_id).where(Labeling.decider.like('ollama:%'))
-        stmt = stmt.where(EventObservation.id.notin_(classified))
+        has_frame  = select(IntermediateResult.event_id)
+        stmt = (stmt
+                .where(EventObservation.id.notin_(classified))
+                .where(EventObservation.id.in_(has_frame))
+                .where(EventObservation.capture_time >= _recent_cutoff()))
+
+    # 'all' — no filter, but cap at recent to avoid drowning in old frameless events
+    else:
+        stmt = stmt.where(EventObservation.capture_time >= _recent_cutoff())
 
     offset = (page - 1) * PAGE_SIZE
     rows = db_session.execute(stmt.offset(offset).limit(PAGE_SIZE + 1)).scalars().unique().all()
@@ -108,16 +137,44 @@ def _fetch(db_session, page, filter_mode):
     return [_serialize(e) for e in rows[:PAGE_SIZE]], has_more
 
 
+def _counts(db_session):
+    cutoff = _recent_cutoff()
+    has_frame = select(IntermediateResult.event_id)
+    classified_ids = select(Labeling.event_id).where(Labeling.decider.like('ollama:%'))
+
+    recent = db_session.execute(
+        select(func.count()).where(EventObservation.capture_time >= cutoff)
+    ).scalar()
+    interesting = db_session.execute(
+        select(func.count(Labeling.event_id.distinct()))
+        .where(Labeling.decider.like('ollama:%'))
+        .where(Labeling.labels.cast(Text).not_like('%noise%'))
+    ).scalar()
+    noise = db_session.execute(
+        select(func.count(Labeling.event_id.distinct()))
+        .where(Labeling.decider.like('ollama:%'))
+        .where(Labeling.labels.cast(Text).like('%noise%'))
+    ).scalar()
+    unclassified = db_session.execute(
+        select(func.count()).select_from(EventObservation)
+        .where(EventObservation.capture_time >= cutoff)
+        .where(EventObservation.id.notin_(classified_ids))
+        .where(EventObservation.id.in_(has_frame))
+    ).scalar()
+    return dict(recent=recent, interesting=interesting, noise=noise, unclassified=unclassified)
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
 
 @browser_bp.route('/browser')
 def browser_page():
-    from api import db  # lazy import avoids circular dependency
+    from api import db
 
-    filter_mode = request.args.get('filter', 'all')
+    filter_mode = request.args.get('filter', 'recent')
     page = request.args.get('page', 1, type=int)
 
     events, has_more = _fetch(db.session, page, filter_mode)
+    counts = _counts(db.session)
 
     return render_template_string(
         _TEMPLATE,
@@ -125,6 +182,7 @@ def browser_page():
         filter=filter_mode,
         page=page,
         has_more=has_more,
+        counts=counts,
         CATEGORY_ICON=CATEGORY_ICON,
         LIGHTING_LABEL=LIGHTING_LABEL,
     )
@@ -134,7 +192,7 @@ def browser_page():
 def events_json():
     from api import db
 
-    filter_mode = request.args.get('filter', 'all')
+    filter_mode = request.args.get('filter', 'recent')
     page = request.args.get('page', 1, type=int)
 
     events, has_more = _fetch(db.session, page, filter_mode)
@@ -151,9 +209,13 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <title>Camera Events</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    .card-thumb { width: 192px; min-height: 108px; flex-shrink: 0; background:#e5e7eb; }
+    .card-thumb { width:192px; min-height:108px; flex-shrink:0; background:#e5e7eb; }
     .card-thumb img { width:192px; height:108px; object-fit:cover; display:block; }
-    @media(max-width:600px){ .card-thumb{ width:100%; } .card-thumb img{ width:100%; height:auto; } .event-card{ flex-direction:column; } }
+    @media(max-width:600px){
+      .card-thumb{ width:100%; }
+      .card-thumb img{ width:100%; height:auto; }
+      .event-card{ flex-direction:column; }
+    }
   </style>
 </head>
 <body class="bg-slate-100 min-h-screen text-slate-800">
@@ -161,12 +223,19 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <header class="bg-slate-900 text-white px-5 py-3 flex flex-wrap items-center gap-3 sticky top-0 z-10 shadow">
   <span class="text-lg font-semibold tracking-tight">📷 Camera Events</span>
   <nav class="flex gap-1 ml-auto flex-wrap">
-    {% for f, label in [('all','All'), ('interesting','Interesting'), ('noise','Noise'), ('unclassified','Unclassified')] %}
+    {% set tabs = [
+        ('recent',       'Recent',       counts.recent),
+        ('interesting',  'Interesting',  counts.interesting),
+        ('noise',        'Noise',        counts.noise),
+        ('unclassified', 'Needs Review', counts.unclassified),
+    ] %}
+    {% for f, label, count in tabs %}
     <a href="?filter={{ f }}"
-       class="px-3 py-1 rounded-full text-sm transition-colors
+       class="px-3 py-1 rounded-full text-sm transition-colors flex items-center gap-1
               {% if filter == f %}bg-white text-slate-900 font-medium
               {% else %}text-slate-300 hover:bg-slate-700{% endif %}">
       {{ label }}
+      {% if count is not none %}<span class="text-xs opacity-70">{{ count }}</span>{% endif %}
     </a>
     {% endfor %}
   </nav>
@@ -176,38 +245,35 @@ _TEMPLATE = r"""<!DOCTYPE html>
 
   {% for ev in events %}
   {% set ml = ev.ml %}
-  <div class="event-card bg-white rounded-xl shadow-sm flex overflow-hidden border border-slate-200
-              {% if ml and ml.interesting %}border-l-4 border-l-green-400
-              {% elif ml and not ml.interesting %}border-l-4 border-l-slate-300
-              {% else %}border-l-4 border-l-yellow-300{% endif %}">
+  {% if ml and ml.interesting %}{% set border = 'border-l-green-400' %}
+  {% elif ml and not ml.interesting %}{% set border = 'border-l-slate-300' %}
+  {% else %}{% set border = 'border-l-amber-300' %}{% endif %}
 
-    {# thumbnail #}
+  <div class="event-card bg-white rounded-xl shadow-sm flex overflow-hidden border border-slate-200 border-l-4 {{ border }}">
+
     <div class="card-thumb flex-shrink-0">
       {% if ev.frame_url %}
       <a href="{{ ev.video_url }}" target="_blank" title="Watch video">
         <img src="{{ ev.frame_url }}" alt="frame" loading="lazy"
-             onerror="this.parentElement.innerHTML='<div class=\'flex items-center justify-center h-full text-slate-400 text-xs p-2\'>no frame</div>'">
+             onerror="this.closest('.card-thumb').innerHTML='<div class=\'flex items-center justify-center h-full text-slate-400 text-xs p-2\'>no frame</div>'">
       </a>
       {% else %}
-      <div class="flex items-center justify-center h-full text-slate-400 text-xs p-2">no frame</div>
+      <a href="{{ ev.video_url }}" target="_blank"
+         class="flex items-center justify-center h-full text-slate-400 text-xs p-2 hover:bg-slate-100">
+        ▶ video
+      </a>
       {% endif %}
     </div>
 
-    {# details #}
     <div class="p-4 flex-1 flex flex-col gap-1 min-w-0">
-
       <div class="flex items-start justify-between gap-2 flex-wrap">
         <div>
           <div class="font-medium text-sm">{{ ev.capture_time }}</div>
           <div class="text-xs text-slate-400 mt-0.5">
-            {{ ev.scene_name }}
-            {% if ev.lighting %}
-              · {{ LIGHTING_LABEL.get(ev.lighting, '') }} {{ ev.lighting }}
-            {% endif %}
+            {{ ev.scene_name }}{% if ev.lighting %} · {{ LIGHTING_LABEL.get(ev.lighting,'') }} {{ ev.lighting }}{% endif %}
           </div>
         </div>
 
-        {# ML classification badge #}
         {% if ml %}
           {% set icon = CATEGORY_ICON.get(ml.category, '❓') %}
           {% if ml.interesting %}
@@ -220,18 +286,16 @@ _TEMPLATE = r"""<!DOCTYPE html>
           </span>
           {% endif %}
         {% else %}
-        <span class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-yellow-100 text-yellow-700">unclassified</span>
+          <span class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-amber-100 text-amber-700">unclassified</span>
         {% endif %}
       </div>
 
-      {# human labels #}
       {% if ev.human %}
       <div class="flex items-center gap-1 flex-wrap mt-1">
         <span class="text-xs text-slate-400">Human:</span>
         {% for lbl in ev.human.labels %}
         <span class="px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 text-xs">{{ lbl }}</span>
         {% endfor %}
-        <span class="text-xs text-slate-300 ml-1">— {{ ev.human.decider }}</span>
       </div>
       {% endif %}
 
@@ -240,7 +304,6 @@ _TEMPLATE = r"""<!DOCTYPE html>
         ▶ Watch clip
       </a>
     </div>
-
   </div>
   {% else %}
   <div class="text-center text-slate-400 py-16">No events found.</div>
@@ -263,63 +326,52 @@ const CATEGORY_ICON = {{ CATEGORY_ICON | tojson }};
 const LIGHTING_LABEL = {{ LIGHTING_LABEL | tojson }};
 
 function badge(ml) {
-  if (!ml) return '<span class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-yellow-100 text-yellow-700">unclassified</span>';
+  if (!ml) return '<span class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-amber-100 text-amber-700">unclassified</span>';
   const icon = CATEGORY_ICON[ml.category] || '❓';
   const conf = ml.confidence ? ` · ${ml.confidence}%` : '';
-  if (ml.interesting) {
+  if (ml.interesting)
     return `<span class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-semibold bg-green-100 text-green-800">${icon} ${ml.category.replace(/_/g,' ')}${conf}</span>`;
-  }
   return `<span class="flex-shrink-0 px-2 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-500">${icon} ${ml.category.replace(/_/g,' ')}${conf}</span>`;
 }
 
 function renderCard(ev) {
   const ml = ev.ml;
-  const borderColor = ml ? (ml.interesting ? 'border-l-green-400' : 'border-l-slate-300') : 'border-l-yellow-300';
-  const lighting = ev.lighting ? `· ${LIGHTING_LABEL[ev.lighting] || ''} ${ev.lighting}` : '';
-
+  const border = ml ? (ml.interesting ? 'border-l-green-400' : 'border-l-slate-300') : 'border-l-amber-300';
+  const lighting = ev.lighting ? ` · ${LIGHTING_LABEL[ev.lighting] || ''} ${ev.lighting}` : '';
   const thumb = ev.frame_url
-    ? `<a href="${ev.video_url}" target="_blank"><img src="${ev.frame_url}" alt="frame" loading="lazy" style="width:192px;height:108px;object-fit:cover;display:block" onerror="this.parentElement.innerHTML='<div style=padding:8px;color:#9ca3af;font-size:12px>no frame</div>'"></a>`
-    : `<div style="padding:8px;color:#9ca3af;font-size:12px">no frame</div>`;
-
-  const humanHtml = ev.human
-    ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px;align-items:center">
-         <span style="font-size:11px;color:#9ca3af">Human:</span>
-         ${ev.human.labels.map(l => `<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#dbeafe;color:#1d4ed8">${l}</span>`).join('')}
-         <span style="font-size:11px;color:#d1d5db">— ${ev.human.decider}</span>
-       </div>`
+    ? `<a href="${ev.video_url}" target="_blank"><img src="${ev.frame_url}" loading="lazy" style="width:192px;height:108px;object-fit:cover;display:block" onerror="this.closest('.card-thumb').innerHTML='<div style=padding:8px;color:#9ca3af;font-size:12px>no frame</div>'"></a>`
+    : `<a href="${ev.video_url}" target="_blank" style="display:flex;align-items:center;justify-content:center;height:100%;color:#9ca3af;font-size:12px;padding:8px">▶ video</a>`;
+  const human = ev.human
+    ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${ev.human.labels.map(l=>`<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#dbeafe;color:#1d4ed8">${l}</span>`).join('')}</div>`
     : '';
-
   return `
-    <div class="event-card bg-white rounded-xl shadow-sm flex overflow-hidden border border-slate-200 border-l-4 ${borderColor}">
+    <div class="event-card bg-white rounded-xl shadow-sm flex overflow-hidden border border-slate-200 border-l-4 ${border}">
       <div class="card-thumb flex-shrink-0">${thumb}</div>
       <div class="p-4 flex-1 flex flex-col gap-1 min-w-0">
         <div class="flex items-start justify-between gap-2 flex-wrap">
           <div>
             <div class="font-medium text-sm">${ev.capture_time}</div>
-            <div class="text-xs text-slate-400 mt-0.5">${ev.scene_name} ${lighting}</div>
+            <div class="text-xs text-slate-400 mt-0.5">${ev.scene_name}${lighting}</div>
           </div>
           ${badge(ml)}
         </div>
-        ${humanHtml}
-        <a href="${ev.video_url}" target="_blank" class="mt-auto pt-2 text-xs text-blue-500 hover:text-blue-700 hover:underline w-fit">▶ Watch clip</a>
+        ${human}
+        <a href="${ev.video_url}" target="_blank" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit">▶ Watch clip</a>
       </div>
     </div>`;
 }
 
-document.getElementById('load-more-btn')?.addEventListener('click', async function () {
+document.getElementById('load-more-btn')?.addEventListener('click', async function() {
   const btn = this;
   const page = parseInt(btn.dataset.page);
   const filter = btn.dataset.filter;
   btn.textContent = 'Loading…';
   btn.disabled = true;
-
   try {
     const resp = await fetch(`/events?page=${page}&filter=${filter}`);
     const data = await resp.json();
     const list = document.getElementById('event-list');
-    data.events.forEach(ev => {
-      list.insertAdjacentHTML('beforeend', renderCard(ev));
-    });
+    data.events.forEach(ev => list.insertAdjacentHTML('beforeend', renderCard(ev)));
     if (data.has_more) {
       btn.dataset.page = page + 1;
       btn.textContent = 'Load more';
@@ -327,12 +379,11 @@ document.getElementById('load-more-btn')?.addEventListener('click', async functi
     } else {
       document.getElementById('load-more-wrap').remove();
     }
-  } catch (e) {
+  } catch(e) {
     btn.textContent = 'Error — try again';
     btn.disabled = false;
   }
 });
 </script>
-
 </body>
 </html>"""

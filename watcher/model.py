@@ -73,7 +73,7 @@ class EventObservation(WatcherBase):
         stmt = (select(cls,Labeling)
                 .join(cls, cls.id == Labeling.event_id)
                 .where(Labeling.labels != None)
-                .where(Labeling.labels.not_like('%noise%'))
+                .where(Labeling.labels.cast(Text).not_like('%noise%'))
                 .order_by(desc(cls.capture_time)).limit(limit)
                 .options(joinedload(cls.labelings))
                 )
