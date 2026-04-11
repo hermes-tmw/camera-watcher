@@ -23,7 +23,7 @@ __all__ = ["task_classify_motion", "run_classify_queue"]
 logger = setup_logging()
 
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-DEFAULT_MODEL = "moondream"
+DEFAULT_MODEL = "llama3.2-vision:latest"
 MAX_IMAGE_WIDTH = 640
 
 CLASSIFICATION_PROMPT = "Classify this security camera image. interesting=true only if a person, vehicle, or animal is clearly visible."
