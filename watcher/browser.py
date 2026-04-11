@@ -222,6 +222,67 @@ def events_json():
     return jsonify({'events': events, 'has_more': has_more, 'page': page})
 
 
+# ── compare route ────────────────────────────────────────────────────────────
+
+def _compare_data(db_session, limit=50):
+    """Return events that have ≥2 distinct ollama models, with per-model results."""
+    from sqlalchemy import func
+
+    # Events with labelings from multiple different ollama models
+    multi = (select(Labeling.event_id)
+             .where(Labeling.decider.like('ollama:%'))
+             .group_by(Labeling.event_id)
+             .having(func.count(Labeling.decider.distinct()) >= 1))
+
+    stmt = (_base_stmt()
+            .where(EventObservation.id.in_(multi))
+            .where(EventObservation.capture_time >= _recent_cutoff())
+            .limit(limit))
+
+    events = db_session.execute(stmt).scalars().unique().all()
+
+    # Collect all distinct model names across these events
+    all_models = sorted({
+        l.decider.removeprefix('ollama:')
+        for e in events for l in e.labelings
+        if l.decider and l.decider.startswith('ollama:')
+    })
+
+    rows = []
+    for ev in events:
+        by_model = {}
+        for lbl in sorted(ev.labelings, key=lambda l: l.id):
+            if not lbl.decider or not lbl.decider.startswith('ollama:'):
+                continue
+            mname = lbl.decider.removeprefix('ollama:')
+            cats = [l for l in lbl.labels if l != 'noise']
+            by_model[mname] = {
+                'category':    cats[0] if cats else 'unknown',
+                'interesting': 'noise' not in lbl.labels,
+                'confidence':  round(lbl.probabilities[0] * 100) if lbl.probabilities else None,
+                'description': lbl.description or '',
+                'git_version': (lbl.git_version or '')[:7],
+            }
+        rows.append({
+            'id':           ev.id,
+            'capture_time': _fmt_time(ev.capture_time),
+            'scene_name':   ev.scene_name or '',
+            'frame_url':    ev.significant_frame_url,
+            'video_url':    ev.video_url,
+            'models':       by_model,
+        })
+
+    return rows, all_models
+
+
+@browser_bp.route('/compare')
+def compare_page():
+    from api import db
+    rows, models = _compare_data(db.session)
+    return render_template_string(_COMPARE_TEMPLATE, rows=rows, models=models,
+                                  CATEGORY_ICON=CATEGORY_ICON)
+
+
 # ── template ──────────────────────────────────────────────────────────────────
 
 _TEMPLATE = r"""<!DOCTYPE html>
@@ -245,6 +306,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 
 <header class="bg-slate-900 text-white px-5 py-3 flex flex-wrap items-center gap-3 sticky top-0 z-10 shadow">
   <span class="text-lg font-semibold tracking-tight">📷 Camera Events</span>
+  <a href="/watcher/compare" class="text-slate-400 hover:text-white text-sm ml-2">Compare ↗</a>
   <nav class="flex gap-1 ml-auto flex-wrap">
     {% set tabs = [
         ('recent',       'Recent',       counts.recent),
@@ -501,6 +563,125 @@ document.getElementById('load-more-btn')?.addEventListener('click', async functi
     btn.disabled = false;
   }
 });
+</script>
+</body>
+</html>"""
+
+
+_COMPARE_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Model Comparison</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .thumb { width:120px; height:68px; object-fit:cover; flex-shrink:0; }
+    .col-cell { min-width:160px; max-width:220px; }
+  </style>
+</head>
+<body class="bg-slate-100 min-h-screen text-slate-800">
+
+<header class="bg-slate-900 text-white px-5 py-3 flex items-center gap-4 sticky top-0 z-10 shadow">
+  <a href="/watcher/browser" class="text-slate-400 hover:text-white text-sm">← Browser</a>
+  <span class="text-lg font-semibold tracking-tight">📊 Model Comparison</span>
+  <span class="text-slate-400 text-sm ml-2">{{ rows|length }} events · {{ models|length }} models</span>
+</header>
+
+{% if not rows %}
+<div class="text-center text-slate-400 py-20">
+  No events with multiple model classifications yet.<br>
+  <span class="text-sm">Run backfill_classify with different -m flags to populate this view.</span>
+</div>
+{% else %}
+<div class="overflow-x-auto">
+<table class="w-full text-sm border-collapse">
+  <thead>
+    <tr class="bg-white border-b border-slate-200">
+      <th class="sticky left-0 bg-white px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase w-48 z-10">Event</th>
+      {% for m in models %}
+      <th class="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase col-cell border-l border-slate-100">
+        {{ m }}
+      </th>
+      {% endfor %}
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+  <tr class="bg-white border-b border-slate-100 hover:bg-slate-50">
+
+    {# thumbnail + time #}
+    <td class="sticky left-0 bg-white px-3 py-2 z-10">
+      <div class="flex gap-2 items-start">
+        {% if row.frame_url %}
+        <img src="{{ row.frame_url }}" class="thumb rounded cursor-pointer"
+             onclick="toggleVid(this, '{{ row.video_url }}')"
+             onerror="this.style.display='none'">
+        {% endif %}
+        <div class="min-w-0">
+          <div class="font-medium text-xs leading-tight">{{ row.capture_time }}</div>
+          <div class="text-xs text-slate-400">{{ row.scene_name }}</div>
+        </div>
+      </div>
+      <video id="vid-{{ row.id }}" controls playsinline class="hidden mt-1 rounded"
+             style="width:100%;max-height:200px">
+        <source src="{{ row.video_url }}" type="video/mp4">
+      </video>
+    </td>
+
+    {# one column per model #}
+    {% for m in models %}
+    {% set r = row.models.get(m) %}
+    <td class="px-4 py-2 align-top col-cell border-l border-slate-100
+               {% if r and r.interesting %}bg-green-50
+               {% elif r and not r.interesting %}bg-slate-50
+               {% else %}bg-amber-50{% endif %}">
+      {% if r %}
+        {% set icon = CATEGORY_ICON.get(r.category, '❓') %}
+        <div class="flex items-center gap-1 flex-wrap">
+          {% if r.interesting %}
+          <span class="px-1.5 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-800">
+            {{ icon }} {{ r.category | replace('_',' ') | title }}
+          </span>
+          {% else %}
+          <span class="px-1.5 py-0.5 rounded-full text-xs bg-slate-200 text-slate-500">
+            {{ icon }} {{ r.category | replace('_',' ') }}
+          </span>
+          {% endif %}
+          {% if r.confidence is not none %}
+          <span class="text-xs text-slate-400">{{ r.confidence }}%</span>
+          {% endif %}
+        </div>
+        {% if r.description %}
+        <div class="text-xs text-slate-500 mt-1 italic leading-snug">{{ r.description }}</div>
+        {% endif %}
+        {% if r.git_version %}
+        <div class="text-xs text-slate-300 mt-0.5">{{ r.git_version }}</div>
+        {% endif %}
+      {% else %}
+        <span class="text-xs text-slate-300">—</span>
+      {% endif %}
+    </td>
+    {% endfor %}
+
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+
+<script>
+function toggleVid(img, url) {
+  const vid = document.getElementById('vid-' + img.closest('tr').querySelector('[id^=vid-]').id.split('-')[1]);
+  if (vid.classList.contains('hidden')) {
+    vid.classList.remove('hidden');
+    vid.play();
+  } else {
+    vid.pause();
+    vid.classList.add('hidden');
+  }
+}
 </script>
 </body>
 </html>"""
