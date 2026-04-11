@@ -3,14 +3,10 @@ import unittest
 from datetime import datetime
 
 from watcher.model import EventClassification, Labeling, WatcherBase, EventObservation
-from watcher.tests.utils import create_db_from_object_model
+from watcher.tests.utils import TransactionalTestCase
 
-class TestLabeling(unittest.TestCase):
-    def setUp(self):
-        self.session = create_db_from_object_model(WatcherBase)
-
-    def tearDown(self):
-        self.session.close()
+class TestLabeling(TransactionalTestCase, unittest.TestCase):
+    pass
 
     def test_labeling(self):
         evt = EventObservation(

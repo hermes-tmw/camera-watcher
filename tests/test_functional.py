@@ -2,14 +2,14 @@ from datetime import datetime
 import unittest
 from base64 import b64encode
 from watcher.connection import application_config
-from watcher.tests.utils import create_db_from_sql
+from watcher.tests.utils import create_db_from_sql, test_db_url
 from api import db, create_app
 
 from watcher import EventClassification, EventObservation
 
 class TestFunctional(unittest.TestCase):
     def setUp(self):
-        app = create_app(db_url='sqlite:///:memory:', testing=True)
+        app = create_app(db_url=test_db_url(), testing=True)
         
         app.app_context().push()
         self.app_dbg = app

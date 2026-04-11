@@ -5,11 +5,11 @@ from base64 import b64encode
 
 from watcher import EventObservation
 from watcher.model import IntermediateResult
-from watcher.tests.utils import create_db_from_sql
+from watcher.tests.utils import create_db_from_sql, test_db_url
 
 class TestAPI(unittest.TestCase):
     def setUp(self):
-        app = create_app(db_url='sqlite:///:memory:', testing=True)
+        app = create_app(db_url=test_db_url(), testing=True)
         
         app.app_context().push()
         self.app = app.test_client()

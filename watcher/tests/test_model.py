@@ -8,14 +8,10 @@ from sqlalchemy.exc import IntegrityError
 
 from watcher import Computation, EventObservation, EventClassification, Labeling
 from watcher.connection import application_config
-from watcher.tests.utils import create_db_from_sql
+from watcher.tests.utils import TransactionalTestCase
 
-class TestModels(unittest.TestCase):
-    def setUp(self):
-        self.session, _ = create_db_from_sql()
-
-    def tearDown(self):
-        self.session.close()
+class TestModels(TransactionalTestCase, unittest.TestCase):
+    pass
         
     def test_event_observation_has_name(self):
         event = EventObservation(video_file="test.mp4", 
