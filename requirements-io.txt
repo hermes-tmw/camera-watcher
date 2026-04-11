@@ -12,3 +12,4 @@ pytz
 pyuwsgi
 pillow
 psycopg2-binary
+fakeredis
