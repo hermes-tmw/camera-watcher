@@ -59,11 +59,14 @@ def _ml_info(event):
         return None
     cats = [l for l in lbl.labels if l != 'noise']
     confidence = round(lbl.probabilities[0] * 100) if lbl.probabilities else None
+    # Strip 'ollama:' prefix for display
+    model_name = lbl.decider.removeprefix('ollama:')
     return {
         'category':    cats[0] if cats else 'unknown',
         'interesting': 'noise' not in lbl.labels,
         'confidence':  confidence,
-        'decider':     lbl.decider,
+        'model':       model_name,
+        'description': lbl.description or '',
     }
 
 
@@ -306,6 +309,13 @@ _TEMPLATE = r"""<!DOCTYPE html>
           {% endif %}
         </div>
 
+        {% if ml and ml.description %}
+        <div class="text-xs text-slate-500 mt-1 italic">{{ ml.description }}</div>
+        {% endif %}
+        {% if ml %}
+        <div class="text-xs text-slate-300">{{ ml.model }}</div>
+        {% endif %}
+
         {% if ev.human %}
         <div class="flex items-center gap-1 flex-wrap mt-1">
           <span class="text-xs text-slate-400">Human:</span>
@@ -365,6 +375,10 @@ function renderCard(ev) {
   const thumb = ev.frame_url
     ? `<a href="${ev.video_url}" target="_blank"><img src="${ev.frame_url}" loading="lazy" style="width:192px;height:108px;object-fit:cover;display:block" onerror="this.closest('.card-thumb').innerHTML='<div style=padding:8px;color:#9ca3af;font-size:12px>no frame</div>'"></a>`
     : `<a href="${ev.video_url}" target="_blank" style="display:flex;align-items:center;justify-content:center;height:100%;color:#9ca3af;font-size:12px;padding:8px">▶ video</a>`;
+  const desc = (ml && ml.description)
+    ? `<div style="font-size:11px;color:#64748b;margin-top:4px;font-style:italic">${ml.description}</div>` : '';
+  const modelName = ml
+    ? `<div style="font-size:11px;color:#cbd5e1">${ml.model}</div>` : '';
   const human = ev.human
     ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${ev.human.labels.map(l=>`<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#dbeafe;color:#1d4ed8">${l}</span>`).join('')}</div>`
     : '';
@@ -381,7 +395,7 @@ function renderCard(ev) {
             </div>
             ${badge(ml)}
           </div>
-          ${human}
+          ${desc}${modelName}${human}
           <button onclick="toggleVideo(this.closest('.event-card'))" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">▶ Watch clip</button>
         </div>
       </div>

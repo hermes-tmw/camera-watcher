@@ -235,6 +235,7 @@ class Labeling(WatcherBase):
     labels: Mapped[List[str]] = mapped_column(JSON)
     mask: Mapped[Optional[List[bool]]] = mapped_column(JSON)
     probabilities: Mapped[Optional[List[float]]] = mapped_column(JSON)
+    description: Mapped[Optional[str]] = mapped_column(Text)
     
     event_id = mapped_column(ForeignKey('event_observations.id'), nullable=False)
     event: Mapped['EventObservation'] = relationship()
