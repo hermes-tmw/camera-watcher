@@ -582,7 +582,7 @@ _COMPARE_TEMPLATE = r"""<!DOCTYPE html>
 </head>
 <body class="bg-slate-100 min-h-screen text-slate-800">
 
-<header class="bg-slate-900 text-white px-5 py-3 flex items-center gap-4 sticky top-0 z-10 shadow">
+<header class="bg-slate-900 text-white px-5 py-3 flex items-center gap-4 shadow">
   <a href="/watcher/browser" class="text-slate-400 hover:text-white text-sm">← Browser</a>
   <span class="text-lg font-semibold tracking-tight">📊 Model Comparison</span>
   <span class="text-slate-400 text-sm ml-2">{{ rows|length }} events · {{ models|length }} models</span>
@@ -594,7 +594,7 @@ _COMPARE_TEMPLATE = r"""<!DOCTYPE html>
   <span class="text-sm">Run backfill_classify with different -m flags to populate this view.</span>
 </div>
 {% else %}
-<div class="overflow-x-auto">
+<div style="overflow:auto; height:calc(100vh - 52px)">
 <table class="w-full text-sm border-collapse">
   <thead class="sticky top-0 z-20">
     <tr class="bg-white border-b border-slate-200 shadow-sm">
