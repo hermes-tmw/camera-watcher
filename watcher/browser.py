@@ -598,7 +598,7 @@ _COMPARE_TEMPLATE = r"""<!DOCTYPE html>
 <table class="w-full text-sm border-collapse">
   <thead>
     <tr class="bg-white border-b border-slate-200">
-      <th class="sticky left-0 bg-white px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase w-48 z-10">Event</th>
+      <th class="sticky left-0 bg-white px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase min-w-48 z-10">Event</th>
       {% for m in models %}
       <th class="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase col-cell border-l border-slate-100">
         {{ m }}
@@ -624,7 +624,7 @@ _COMPARE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
       <video id="vid-{{ row.id }}" controls playsinline class="hidden mt-1 rounded"
-             style="width:100%;max-height:200px">
+             style="width:360px;max-height:600px">
         <source src="{{ row.video_url }}" type="video/mp4">
       </video>
     </td>
