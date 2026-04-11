@@ -596,11 +596,11 @@ _COMPARE_TEMPLATE = r"""<!DOCTYPE html>
 {% else %}
 <div class="overflow-x-auto">
 <table class="w-full text-sm border-collapse">
-  <thead>
-    <tr class="bg-white border-b border-slate-200">
-      <th class="sticky left-0 bg-white px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase min-w-48 z-10">Event</th>
+  <thead class="sticky top-0 z-20">
+    <tr class="bg-white border-b border-slate-200 shadow-sm">
+      <th class="sticky left-0 bg-white px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase min-w-48 z-30">Event</th>
       {% for m in models %}
-      <th class="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase col-cell border-l border-slate-100">
+      <th class="bg-white px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase col-cell border-l border-slate-100">
         {{ m }}
       </th>
       {% endfor %}
@@ -611,7 +611,7 @@ _COMPARE_TEMPLATE = r"""<!DOCTYPE html>
   <tr class="bg-white border-b border-slate-100 hover:bg-slate-50">
 
     {# thumbnail + time #}
-    <td class="sticky left-0 bg-white px-3 py-2 z-10">
+    <td class="sticky left-0 bg-white px-3 py-2 z-10 shadow-[1px_0_0_0_#e2e8f0]">
       <div class="flex gap-2 items-start">
         {% if row.frame_url %}
         <img src="{{ row.frame_url }}" class="thumb rounded cursor-pointer"
