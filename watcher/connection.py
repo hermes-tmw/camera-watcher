@@ -39,10 +39,17 @@ def git_version() -> str:
     try:
         import subprocess
         v = subprocess.check_output(
-            ['git', 'rev-parse', 'HEAD'],
+            ['git', 'rev-parse', '--short', 'HEAD'],
             cwd=Path(__file__).parent.parent,
             stderr=subprocess.DEVNULL
         ).decode().strip()
+        # Append -dirty if working tree has uncommitted changes
+        dirty = subprocess.run(
+            ['git', 'diff', '--quiet', 'HEAD'],
+            cwd=Path(__file__).parent.parent
+        ).returncode != 0
+        if dirty:
+            v += '-dirty'
         _git_version_cache = v[:7]
         return _git_version_cache
     except Exception:
