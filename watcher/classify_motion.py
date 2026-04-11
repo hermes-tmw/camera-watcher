@@ -24,7 +24,14 @@ DEFAULT_MODEL = "moondream"
 MAX_IMAGE_WIDTH = 640
 
 CLASSIFICATION_PROMPT = """Security camera image. Reply with only this JSON, no other text:
-{"category": "<person|vehicle|animal|lighting_change|wind_vegetation|shadow|unknown>", "interesting": <true|false>, "confidence": <0.0-1.0>}
+{"category": "<person|vehicle|animal|lighting_change|wind_vegetation|shadow|unknown>", "interesting": <true|false>, "confidence": <0.0-1.0>, "description": "<one sentence>"}
+
+interesting=true only if a person, vehicle, or animal is clearly visible."""
+
+# moondream cannot produce a confidence score — use a simplified prompt that
+# skips confidence but captures its free-text description ability
+CLASSIFICATION_PROMPT_MOONDREAM = """Security camera image. Reply with only this JSON, no other text:
+{"category": "<person|vehicle|animal|lighting_change|wind_vegetation|shadow|unknown>", "interesting": <true|false>, "description": "<one brief sentence describing what you see>"}
 
 interesting=true only if a person, vehicle, or animal is clearly visible."""
 
@@ -91,9 +98,10 @@ def _query_ollama(img: Image.Image, model: str = None) -> dict:
     host = _ollama_host()
     model = model or _ollama_model()
 
+    prompt = CLASSIFICATION_PROMPT_MOONDREAM if 'moondream' in model else CLASSIFICATION_PROMPT
     payload = {
         "model": model,
-        "prompt": CLASSIFICATION_PROMPT,
+        "prompt": prompt,
         "images": [_encode_pil(img)],
         "stream": False,
         "format": "json",

@@ -58,7 +58,7 @@ def _ml_info(event):
     if not lbl:
         return None
     cats = [l for l in lbl.labels if l != 'noise']
-    confidence = round(lbl.probabilities[0] * 100) if lbl.probabilities else None
+    confidence = round(lbl.probabilities[0] * 100) if (lbl.probabilities and lbl.probabilities[0] > 0) else None
     # Strip 'ollama:' prefix for display
     model_name = lbl.decider.removeprefix('ollama:')
     return {
@@ -259,7 +259,7 @@ def _compare_data(db_session, limit=50):
             by_model[mname] = {
                 'category':    cats[0] if cats else 'unknown',
                 'interesting': 'noise' not in lbl.labels,
-                'confidence':  round(lbl.probabilities[0] * 100) if lbl.probabilities else None,
+                'confidence':  round(lbl.probabilities[0] * 100) if (lbl.probabilities and lbl.probabilities[0] > 0) else None,
                 'description': lbl.description or '',
                 'git_version': (lbl.git_version or '')[:7],
             }
