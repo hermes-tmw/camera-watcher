@@ -5,6 +5,9 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+from typing import Literal, Optional
+from pydantic import BaseModel, Field
+
 import requests
 import sqlalchemy
 from PIL import Image
@@ -23,17 +26,27 @@ DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "moondream"
 MAX_IMAGE_WIDTH = 640
 
-CLASSIFICATION_PROMPT = """Security camera image. Reply with only this JSON, no other text:
-{"category": "<person|vehicle|animal|lighting_change|wind_vegetation|shadow|unknown>", "interesting": <true|false>, "confidence": <0.0-1.0>, "description": "<one sentence>"}
+CLASSIFICATION_PROMPT = "Classify this security camera image. interesting=true only if a person, vehicle, or animal is clearly visible."
 
-interesting=true only if a person, vehicle, or animal is clearly visible."""
+Category = Literal["person", "vehicle", "animal",
+                   "lighting_change", "wind_vegetation", "shadow", "unknown"]
 
-# moondream cannot produce a confidence score — use a simplified prompt that
-# skips confidence but captures its free-text description ability
-CLASSIFICATION_PROMPT_MOONDREAM = """Security camera image. Reply with only this JSON, no other text:
-{"category": "<person|vehicle|animal|lighting_change|wind_vegetation|shadow|unknown>", "interesting": <true|false>, "description": "<one brief sentence describing what you see>"}
+class ClassificationResult(BaseModel):
+    category: Category
+    interesting: bool
+    description: str
+    confidence: float = Field(ge=0.0, le=1.0)
 
-interesting=true only if a person, vehicle, or animal is clearly visible."""
+class ClassificationResultNoConfidence(BaseModel):
+    """For models (e.g. moondream) that can't produce a calibrated confidence score."""
+    category: Category
+    interesting: bool
+    description: str
+
+
+def _schema_for(model: str) -> dict:
+    cls = ClassificationResultNoConfidence if "moondream" in model else ClassificationResult
+    return cls.model_json_schema()
 
 
 def _ollama_host():
@@ -94,17 +107,37 @@ def _encode_pil(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def _query_ollama(img: Image.Image, model: str = None) -> dict:
+def _ollama_log_path() -> Path:
+    log_dir = Path(application_config('log', 'FILE') or 'log/watcher.log').parent
+    return log_dir / 'ollama.jsonl'
+
+
+def _log_ollama(event_name: str, model: str, prompt: str, schema: dict,
+                raw_response: str, parsed: dict):
+    entry = {
+        "ts":       datetime.now().isoformat(),
+        "event":    event_name,
+        "request":  {"model": model, "prompt": prompt, "format": schema},
+        "response": raw_response,
+        "parsed":   parsed,
+    }
+    try:
+        with open(_ollama_log_path(), 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except OSError as e:
+        logger.warning(f"Could not write ollama log: {e}")
+
+
+def _query_ollama(img: Image.Image, model: str = None, event_name: str = '') -> dict:
     host = _ollama_host()
     model = model or _ollama_model()
 
-    prompt = CLASSIFICATION_PROMPT_MOONDREAM if 'moondream' in model else CLASSIFICATION_PROMPT
     payload = {
         "model": model,
-        "prompt": prompt,
+        "prompt": CLASSIFICATION_PROMPT,
         "images": [_encode_pil(img)],
         "stream": False,
-        "format": "json",
+        "format": _schema_for(model),
     }
 
     try:
@@ -115,10 +148,13 @@ def _query_ollama(img: Image.Image, model: str = None) -> dict:
 
     raw = resp.json().get("response", "{}")
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
         logger.warning(f"Ollama returned non-JSON response: {raw!r}")
-        return {"category": "unknown", "interesting": False, "confidence": 0.0, "description": raw}
+        parsed = {"category": "unknown", "interesting": False, "confidence": 0.0, "description": raw}
+
+    _log_ollama(event_name, model, CLASSIFICATION_PROMPT, _schema_for(model), raw, parsed)
+    return parsed
 
 
 def task_classify_motion(event_name: str, model: str = None):
@@ -132,7 +168,7 @@ def task_classify_motion(event_name: str, model: str = None):
             raise ValueError(f"event {event_name} not found in database")
 
         img = _frame_from_event(event)
-        result = _query_ollama(img, model=model)
+        result = _query_ollama(img, model=model, event_name=event_name)
 
         category = result.get("category", "unknown")
         # moondream sometimes returns interesting as a float — treat >0.5 as True

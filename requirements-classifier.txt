@@ -10,3 +10,4 @@ requests-toolbelt>=0.9.1
 pytz
 pillow
 psycopg2-binary
+pydantic
