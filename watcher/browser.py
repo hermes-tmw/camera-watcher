@@ -641,23 +641,21 @@ _COMPARE_TEMPLATE = r"""<!DOCTYPE html>
         <div class="flex items-center gap-1 flex-wrap">
           {% if r.interesting %}
           <span class="px-1.5 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-800">
-            {{ icon }} {{ r.category | replace('_',' ') | title }}
+            {{ icon }} {{ r.category | replace('_',' ') | title }}{% if r.confidence is not none %} · {{ r.confidence }}%{% endif %}
           </span>
           {% else %}
           <span class="px-1.5 py-0.5 rounded-full text-xs bg-slate-200 text-slate-500">
-            {{ icon }} {{ r.category | replace('_',' ') }}
+            {{ icon }} {{ r.category | replace('_',' ') }}{% if r.confidence is not none %} {{ r.confidence }}%{% endif %}
           </span>
-          {% endif %}
-          {% if r.confidence is not none %}
-          <span class="text-xs text-slate-400">{{ r.confidence }}%</span>
           {% endif %}
         </div>
         {% if r.description %}
-        <div class="text-xs text-slate-500 mt-1 italic leading-snug">{{ r.description }}</div>
+        <div class="text-xs text-slate-600 mt-1 leading-snug">{{ r.description }}</div>
         {% endif %}
-        {% if r.git_version %}
-        <div class="text-xs text-slate-300 mt-0.5">{{ r.git_version }}</div>
-        {% endif %}
+        <div class="text-xs text-slate-300 mt-0.5">
+          {% if r.confidence is not none %}{{ r.confidence }}%{% endif %}
+          {% if r.git_version %}<span class="ml-1">{{ r.git_version }}</span>{% endif %}
+        </div>
       {% else %}
         <span class="text-xs text-slate-300">—</span>
       {% endif %}
