@@ -67,6 +67,7 @@ def _ml_info(event):
         'confidence':  confidence,
         'model':       model_name,
         'description': lbl.description or '',
+        'git_version': (lbl.git_version or '')[:7],
     }
 
 
@@ -313,7 +314,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
         <div class="text-xs text-slate-500 mt-1 italic">{{ ml.description }}</div>
         {% endif %}
         {% if ml %}
-        <div class="text-xs text-slate-300">{{ ml.model }}</div>
+        <div class="text-xs text-slate-300">{{ ml.model }}{% if ml.git_version %} · {{ ml.git_version }}{% endif %}</div>
         {% endif %}
 
         {% if ev.human %}
@@ -378,7 +379,7 @@ function renderCard(ev) {
   const desc = (ml && ml.description)
     ? `<div style="font-size:11px;color:#64748b;margin-top:4px;font-style:italic">${ml.description}</div>` : '';
   const modelName = ml
-    ? `<div style="font-size:11px;color:#cbd5e1">${ml.model}</div>` : '';
+    ? `<div style="font-size:11px;color:#cbd5e1">${ml.model}${ml.git_version ? ' · ' + ml.git_version : ''}</div>` : '';
   const human = ev.human
     ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${ev.human.labels.map(l=>`<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#dbeafe;color:#1d4ed8">${l}</span>`).join('')}</div>`
     : '';

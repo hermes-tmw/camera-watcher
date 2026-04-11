@@ -12,4 +12,7 @@ WORKDIR /app/camera-watcher
 COPY *.py ./
 COPY watcher watcher/
 
+ARG GIT_VERSION=unknown
+RUN echo $GIT_VERSION > VERSION
+
 COPY ./etc/watcher.cfg /usr/local/etc/watcher.cfg

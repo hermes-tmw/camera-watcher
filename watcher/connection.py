@@ -15,7 +15,41 @@ def in_docker() -> bool:
     return os.path.isfile('/.dockerenv') 
 
 
-__all__ = ['TunneledConnection','application_config','redis_connection','in_docker', 'application_path_for']
+__all__ = ['TunneledConnection','application_config','redis_connection','in_docker', 'application_path_for', 'git_version']
+
+_git_version_cache = None
+
+def git_version() -> str:
+    """Return the first 7 chars of the current git commit hash.
+
+    Reads from a VERSION file written at Docker build time, falls back
+    to running git locally, falls back to 'unknown'.
+    """
+    global _git_version_cache
+    if _git_version_cache:
+        return _git_version_cache
+
+    version_file = Path(__file__).parent.parent / 'VERSION'
+    if version_file.exists():
+        v = version_file.read_text().strip()
+        if v and v != 'unknown':
+            _git_version_cache = v[:7]
+            return _git_version_cache
+
+    try:
+        import subprocess
+        v = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=Path(__file__).parent.parent,
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        _git_version_cache = v[:7]
+        return _git_version_cache
+    except Exception:
+        pass
+
+    _git_version_cache = 'unknown'
+    return _git_version_cache
 
 def redis_connection():
     redis_host = os.environ.get('REDIS_HOST') or application_config('system','REDIS_HOST')

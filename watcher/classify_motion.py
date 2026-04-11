@@ -10,7 +10,7 @@ import sqlalchemy
 from PIL import Image
 from rq import Queue, Retry, Worker
 
-from .connection import TunneledConnection, application_config, redis_connection
+from .connection import TunneledConnection, application_config, redis_connection, git_version
 from .model import EventObservation, Labeling
 
 from . import setup_logging
@@ -146,6 +146,7 @@ def task_classify_motion(event_name: str, model: str = None):
             labels=labels,
             probabilities=[confidence],
             description=description or None,
+            git_version=git_version(),
             mask=None,
         )
         session.add(lbl)

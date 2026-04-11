@@ -26,6 +26,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-io
+      args:
+        GIT_VERSION: ${GIT_VERSION:-unknown}
     command: ./watchutil.py ioworker
     user: "0:44"
     depends_on:
@@ -43,6 +45,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-video
+      args:
+        GIT_VERSION: ${GIT_VERSION:-unknown}
     command: ./watchutil.py videoworker
     user: "0:44"
     depends_on:
@@ -61,6 +65,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-predictor
+      args:
+        GIT_VERSION: ${GIT_VERSION:-unknown}
     command: ./watchutil.py predictionworker
     depends_on:
       - redis
@@ -78,6 +84,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-classifier
+      args:
+        GIT_VERSION: ${GIT_VERSION:-unknown}
     command: ./watchutil.py classifyworker
     user: "0:44"
     depends_on:
@@ -98,6 +106,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-api
+      args:
+        GIT_VERSION: ${GIT_VERSION:-unknown}
     profiles: ["web", "all"]
     user: "0:44"
     command: uwsgi --ini /usr/local/etc/uwsgi.ini
