@@ -102,6 +102,40 @@ services:
       - WATCHER_CLASSIFICATION_OLLAMA_HOST=http://host.docker.internal:11434
     restart: always
 
+  stealthcam:
+    profiles: ["all"]
+    build:
+      context: .
+      dockerfile: Dockerfile-stealthcam
+      args:
+        GIT_VERSION: ${GIT_VERSION:-}
+    command: python -m stealthcam.worker
+    user: "0:44"
+    depends_on:
+      - redis
+    volumes:
+      - /data/video:/data/video
+      - ./etc:/usr/local/etc:ro
+      - ./log:/var/log
+      - /home/claw/.hermes/secrets/stealthcam.json:/secrets/stealthcam.json:ro
+      - /home/claw/.hermes/secrets/mattermost_persona_tokens.json:/secrets/mattermost_persona_tokens.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
+      - WATCHER_LOG_FILE=/var/log/watcher/stealthcam.log
+      - STEALTHCAM_SECRETS_STEALTHCAM=/secrets/stealthcam.json
+      - STEALTHCAM_SECRETS_MATTERMOST=/secrets/mattermost_persona_tokens.json
+      - STEALTHCAM_MATTERMOST_BASE_URL=http://mira:8065
+      - STEALTHCAM_MATTERMOST_CHANNEL_ID=n7c5ooyjabb4dje5d81e9y5spw
+      - STEALTHCAM_MATTERMOST_BOT=cody
+      - STEALTHCAM_PIPELINE_DB=/data/video/watcher/stealthcam/stealthcam.db
+      - STEALTHCAM_SUBIMAGE_DIR=/data/video/watcher/stealthcam
+      - STEALTHCAM_DETECTOR_WEIGHTS=/data/video/watcher/stealthcam/yolo11n.pt
+      - STEALTHCAM_DETECTOR_DEVICE=cpu
+      - STEALTHCAM_DESCRIBER_OLLAMA_HOST=http://host.docker.internal:11434
+    restart: always
+
   api:
     build:
       context: .

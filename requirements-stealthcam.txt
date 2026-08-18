@@ -1,0 +1,7 @@
+ultralytics
+pillow
+opencv-python
+requests
+pyyaml
+psycopg2-binary
+pytz

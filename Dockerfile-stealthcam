@@ -1,0 +1,24 @@
+FROM python:3-bookworm
+
+## OS dependencies
+RUN apt-get update && apt-get -y install sqlite3 redis
+
+## python requirements — CPU torch first (no nvidia-container-toolkit on this
+## host; YOLO11n runs CPU in-container, VLM goes to host ollama), then
+## ultralytics + the pipeline's direct deps.
+WORKDIR /app
+COPY requirements-stealthcam.txt ./
+RUN python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+RUN python3 -m pip install -r requirements-stealthcam.txt
+
+## source
+RUN mkdir -p /app/camera-watcher
+WORKDIR /app/camera-watcher
+
+COPY stealthcam stealthcam/
+
+ARG GIT_VERSION=unknown
+RUN echo $GIT_VERSION > VERSION
+
+## Defense-in-depth: load .pt weights with torch weights_only=True (no pickle).
+ENV ULTRALYTICS_SAFE_LOAD=1
