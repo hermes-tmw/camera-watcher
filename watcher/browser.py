@@ -12,6 +12,27 @@ __all__ = ['browser_bp']
 
 browser_bp = Blueprint('browser', __name__)
 
+# ML deciders: the existing ollama:<model> prefix, plus the stealthcam
+# pipeline's yolo11n+vlm decider (see stealthcam-pipeline).
+ML_DECIDER_PREFIX = 'ollama:'
+ML_DECIDER_EXACT = 'yolo11n+vlm'
+
+
+def _is_ml_decider(decider):
+    return bool(decider) and (decider.startswith(ML_DECIDER_PREFIX) or decider == ML_DECIDER_EXACT)
+
+
+def _ml_decider_predicate():
+    from sqlalchemy import or_
+    return or_(Labeling.decider.like(ML_DECIDER_PREFIX + '%'),
+               Labeling.decider == ML_DECIDER_EXACT)
+
+
+def _model_name(decider):
+    if decider.startswith(ML_DECIDER_PREFIX):
+        return decider.removeprefix(ML_DECIDER_PREFIX)
+    return decider
+
 PAGE_SIZE = 24
 RECENT_DAYS = 60   # "recent" filter window
 
@@ -52,15 +73,14 @@ def _fmt_time(dt):
 
 
 def _ml_info(event):
-    # Use the most recently decided ollama labeling (highest id)
-    ollama = [l for l in event.labelings if l.decider and l.decider.startswith('ollama:')]
-    lbl = max(ollama, key=lambda l: l.id) if ollama else None
+    # Use the most recently decided ML labeling (highest id)
+    ml = [l for l in event.labelings if _is_ml_decider(l.decider)]
+    lbl = max(ml, key=lambda l: l.id) if ml else None
     if not lbl:
         return None
     cats = [l for l in lbl.labels if l != 'noise']
     confidence = round(lbl.probabilities[0] * 100) if (lbl.probabilities and lbl.probabilities[0] > 0) else None
-    # Strip 'ollama:' prefix for display
-    model_name = lbl.decider.removeprefix('ollama:')
+    model_name = _model_name(lbl.decider)
     return {
         'category':    cats[0] if cats else 'unknown',
         'interesting': 'noise' not in lbl.labels,
@@ -115,18 +135,18 @@ def _fetch(db_session, page, filter_mode):
 
     elif filter_mode == 'interesting':
         ids = (select(Labeling.event_id)
-               .where(Labeling.decider.like('ollama:%'))
+               .where(_ml_decider_predicate())
                .where(Labeling.labels.cast(Text).not_like('%noise%')))
         stmt = stmt.where(EventObservation.id.in_(ids))
 
     elif filter_mode == 'noise':
         ids = (select(Labeling.event_id)
-               .where(Labeling.decider.like('ollama:%'))
+               .where(_ml_decider_predicate())
                .where(Labeling.labels.cast(Text).like('%noise%')))
         stmt = stmt.where(EventObservation.id.in_(ids))
 
     elif filter_mode == 'unclassified':
-        classified = select(Labeling.event_id).where(Labeling.decider.like('ollama:%'))
+        classified = select(Labeling.event_id).where(_ml_decider_predicate())
         has_frame  = select(IntermediateResult.event_id)
         stmt = (stmt
                 .where(EventObservation.id.notin_(classified))
@@ -146,19 +166,19 @@ def _fetch(db_session, page, filter_mode):
 def _counts(db_session):
     cutoff = _recent_cutoff()
     has_frame = select(IntermediateResult.event_id)
-    classified_ids = select(Labeling.event_id).where(Labeling.decider.like('ollama:%'))
+    classified_ids = select(Labeling.event_id).where(_ml_decider_predicate())
 
     recent = db_session.execute(
         select(func.count()).where(EventObservation.capture_time >= cutoff)
     ).scalar()
     interesting = db_session.execute(
         select(func.count(Labeling.event_id.distinct()))
-        .where(Labeling.decider.like('ollama:%'))
+        .where(_ml_decider_predicate())
         .where(Labeling.labels.cast(Text).not_like('%noise%'))
     ).scalar()
     noise = db_session.execute(
         select(func.count(Labeling.event_id.distinct()))
-        .where(Labeling.decider.like('ollama:%'))
+        .where(_ml_decider_predicate())
         .where(Labeling.labels.cast(Text).like('%noise%'))
     ).scalar()
     unclassified = db_session.execute(
@@ -230,7 +250,7 @@ def _compare_data(db_session, limit=50):
 
     # Events with labelings from multiple different ollama models
     multi = (select(Labeling.event_id)
-             .where(Labeling.decider.like('ollama:%'))
+             .where(_ml_decider_predicate())
              .group_by(Labeling.event_id)
              .having(func.count(Labeling.decider.distinct()) >= 1))
 
@@ -243,18 +263,18 @@ def _compare_data(db_session, limit=50):
 
     # Collect all distinct model names across these events
     all_models = sorted({
-        l.decider.removeprefix('ollama:')
+        _model_name(l.decider)
         for e in events for l in e.labelings
-        if l.decider and l.decider.startswith('ollama:')
+        if _is_ml_decider(l.decider)
     })
 
     rows = []
     for ev in events:
         by_model = {}
         for lbl in sorted(ev.labelings, key=lambda l: l.id):
-            if not lbl.decider or not lbl.decider.startswith('ollama:'):
+            if not _is_ml_decider(lbl.decider):
                 continue
-            mname = lbl.decider.removeprefix('ollama:')
+            mname = _model_name(lbl.decider)
             cats = [l for l in lbl.labels if l != 'noise']
             by_model[mname] = {
                 'category':    cats[0] if cats else 'unknown',
