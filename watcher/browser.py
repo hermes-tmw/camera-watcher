@@ -17,6 +17,30 @@ browser_bp = Blueprint('browser', __name__)
 ML_DECIDER_PREFIX = 'ollama:'
 ML_DECIDER_EXACT = 'yolo11n+vlm'
 
+# Media file extensions that are still photos, not video. The stealthcam
+# pipeline writes sub-image JPEGs (video_file = '<guid>_<n>.JPG'); the
+# dashboard must render those as <img>, not a <video> player.
+PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+
+
+def _is_photo(event) -> bool:
+    """True when the event's media file is a still image, not a video."""
+    name = (event.video_file or '').lower()
+    return any(name.endswith(ext) for ext in PHOTO_EXTENSIONS)
+
+
+def _escape_like(s: str) -> str:
+    """Escape LIKE wildcards so user input matches literally."""
+    return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
+def _description_subq(description: str):
+    """Subquery: event ids whose ML labeling description matches (substring)."""
+    pattern = '%' + _escape_like(description) + '%'
+    return (select(Labeling.event_id)
+            .where(_ml_decider_predicate())
+            .where(Labeling.description.ilike(pattern, escape='\\')))
+
 
 def _is_ml_decider(decider):
     return bool(decider) and (decider.startswith(ML_DECIDER_PREFIX) or decider == ML_DECIDER_EXACT)
@@ -108,6 +132,7 @@ def _serialize(event):
         'lighting':     event.lighting_type or '',
         'video_url':    event.video_url,
         'frame_url':    event.significant_frame_url,
+        'is_photo':     _is_photo(event),
         'ml':           _ml_info(event),
         'human':        _human_info(event),
     }
@@ -128,11 +153,14 @@ def _has_frame_subq():
     return select(IntermediateResult.event_id).correlate(EventObservation)
 
 
-def _fetch(db_session, page, filter_mode, camera=None):
+def _fetch(db_session, page, filter_mode, camera=None, description=None):
     stmt = _base_stmt()
 
     if camera:
         stmt = stmt.where(EventObservation.camera == camera)
+
+    if description:
+        stmt = stmt.where(EventObservation.id.in_(_description_subq(description)))
 
     if filter_mode == 'recent':
         stmt = stmt.where(EventObservation.capture_time >= _recent_cutoff())
@@ -214,8 +242,9 @@ def browser_page():
     filter_mode = request.args.get('filter', 'recent')
     page = request.args.get('page', 1, type=int)
     camera = request.args.get('camera') or None
+    description = (request.args.get('description') or '').strip() or None
 
-    events, has_more = _fetch(db.session, page, filter_mode, camera)
+    events, has_more = _fetch(db.session, page, filter_mode, camera, description)
     counts = _counts(db.session)
     cameras = _cameras(db.session)
 
@@ -228,6 +257,7 @@ def browser_page():
         counts=counts,
         cameras=cameras,
         camera=camera,
+        description=description or '',
         CATEGORY_ICON=CATEGORY_ICON,
         LIGHTING_LABEL=LIGHTING_LABEL,
     )
@@ -240,6 +270,7 @@ def events_json():
     filter_mode = request.args.get('filter', 'recent')
     page        = request.args.get('page', 1, type=int)
     camera      = request.args.get('camera') or None
+    description = (request.args.get('description') or '').strip() or None
     since_id    = request.args.get('since_id', type=int)   # newer events only
     ids         = request.args.getlist('id', type=int)      # re-fetch specific events
 
@@ -257,16 +288,18 @@ def events_json():
                 .where(EventObservation.id > since_id))
         if camera:
             stmt = stmt.where(EventObservation.camera == camera)
+        if description:
+            stmt = stmt.where(EventObservation.id.in_(_description_subq(description)))
         rows = db.session.execute(stmt).scalars().unique().all()
         return jsonify({'events': [_serialize(e) for e in rows]})
 
-    events, has_more = _fetch(db.session, page, filter_mode, camera)
+    events, has_more = _fetch(db.session, page, filter_mode, camera, description)
     return jsonify({'events': events, 'has_more': has_more, 'page': page})
 
 
 # ── compare route ────────────────────────────────────────────────────────────
 
-def _compare_data(db_session, limit=50, camera=None):
+def _compare_data(db_session, limit=50, camera=None, description=None):
     """Return events that have ≥2 distinct ollama models, with per-model results."""
     from sqlalchemy import func
 
@@ -282,6 +315,9 @@ def _compare_data(db_session, limit=50, camera=None):
 
     if camera:
         stmt = stmt.where(EventObservation.camera == camera)
+
+    if description:
+        stmt = stmt.where(EventObservation.id.in_(_description_subq(description)))
 
     stmt = stmt.limit(limit)
 
@@ -315,6 +351,7 @@ def _compare_data(db_session, limit=50, camera=None):
             'scene_name':   ev.scene_name or '',
             'frame_url':    ev.significant_frame_url,
             'video_url':    ev.video_url,
+            'is_photo':     _is_photo(ev),
             'models':       by_model,
         })
 
@@ -325,10 +362,12 @@ def _compare_data(db_session, limit=50, camera=None):
 def compare_page():
     from api import db
     camera = request.args.get('camera') or None
-    rows, models = _compare_data(db.session, camera=camera)
+    description = (request.args.get('description') or '').strip() or None
+    rows, models = _compare_data(db.session, camera=camera, description=description)
     cameras = _cameras(db.session)
     return render_template_string(_COMPARE_TEMPLATE, rows=rows, models=models,
                                   camera=camera, cameras=cameras,
+                                  description=description or '',
                                   CATEGORY_ICON=CATEGORY_ICON)
 
 
@@ -360,13 +399,18 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <select id="camera-select"
           class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"
           data-filter="{{ filter }}"
-          onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.value)">
+          data-description="{{ description }}"
+          onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.value)+'&description='+encodeURIComponent(this.dataset.description)">
     <option value="">All cameras</option>
     {% for c in cameras %}
     <option value="{{ c }}" {% if camera == c %}selected{% endif %}>{{ c }}</option>
     {% endfor %}
   </select>
   {% endif %}
+  <input id="description-input" type="text" value="{{ description }}" placeholder="Filter by description…"
+         class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none w-48"
+         data-filter="{{ filter }}" data-camera="{{ camera or '' }}"
+         onkeydown="if(event.key==='Enter'){location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.value)}">
   <nav class="flex gap-1 ml-auto flex-wrap">
     {% set tabs = [
         ('recent',       'Recent',       counts.recent),
@@ -375,7 +419,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
         ('unclassified', 'Needs Review', counts.unclassified),
     ] %}
     {% for f, label, count in tabs %}
-    <a href="?filter={{ f }}{% if camera %}&camera={{ camera }}{% endif %}"
+    <a href="?filter={{ f }}{% if camera %}&camera={{ camera }}{% endif %}{% if description %}&description={{ description }}{% endif %}"
        class="px-3 py-1 rounded-full text-sm transition-colors flex items-center gap-1
               {% if filter == f %}bg-white text-slate-900 font-medium
               {% else %}text-slate-300 hover:bg-slate-700{% endif %}">
@@ -398,7 +442,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
        data-id="{{ ev.id }}" data-classified="{{ '1' if ml else '0' }}" data-video="{{ ev.video_url }}">
 
     <div class="flex">
-      <div class="card-thumb flex-shrink-0 cursor-pointer" onclick="toggleVideo(this.closest('.event-card'))">
+      <div class="card-thumb flex-shrink-0 {% if not ev.is_photo %}cursor-pointer{% endif %}" {% if not ev.is_photo %}onclick="toggleVideo(this.closest('.event-card'))"{% endif %}>
         {% if ev.frame_url %}
         <img src="{{ ev.frame_url }}" alt="frame" loading="lazy"
              onerror="this.closest('.card-thumb').innerHTML='<div class=\'flex items-center justify-center h-full text-slate-400 text-xs p-2\'>no frame</div>'">
@@ -448,18 +492,22 @@ _TEMPLATE = r"""<!DOCTYPE html>
         </div>
         {% endif %}
 
+        {% if not ev.is_photo %}
         <button onclick="toggleVideo(this.closest('.event-card'))"
                 class="mt-auto pt-2 text-xs text-blue-500 hover:text-blue-700 hover:underline w-fit text-left">
           ▶ Watch clip
         </button>
+        {% endif %}
       </div>
     </div>
 
+    {% if not ev.is_photo %}
     <div class="video-player hidden">
       <video controls playsinline style="width:100%;display:block;max-height:400px;background:#000">
         <source src="{{ ev.video_url }}" type="video/mp4">
       </video>
     </div>
+    {% endif %}
 
   </div>
   {% else %}
@@ -472,7 +520,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <div class="text-center py-6" id="load-more-wrap">
   <button id="load-more-btn"
           class="px-6 py-2 bg-slate-800 text-white text-sm rounded-full hover:bg-slate-700 transition-colors"
-          data-page="{{ page + 1 }}" data-filter="{{ filter }}" data-camera="{{ camera or '' }}">
+          data-page="{{ page + 1 }}" data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}">
     Load more
   </button>
 </div>
@@ -493,11 +541,12 @@ function badge(ml) {
 
 function renderCard(ev) {
   const ml = ev.ml;
+  const isPhoto = !!ev.is_photo;
   const border = ml ? (ml.interesting ? 'border-l-green-400' : 'border-l-slate-300') : 'border-l-amber-300';
   const lighting = ev.lighting ? ` · ${LIGHTING_LABEL[ev.lighting] || ''} ${ev.lighting}` : '';
   const thumb = ev.frame_url
     ? `<a href="${ev.video_url}" target="_blank"><img src="${ev.frame_url}" loading="lazy" style="width:192px;height:108px;object-fit:cover;display:block" onerror="this.closest('.card-thumb').innerHTML='<div style=padding:8px;color:#9ca3af;font-size:12px>no frame</div>'"></a>`
-    : `<a href="${ev.video_url}" target="_blank" style="display:flex;align-items:center;justify-content:center;height:100%;color:#9ca3af;font-size:12px;padding:8px">▶ video</a>`;
+    : `<a href="${ev.video_url}" target="_blank" style="display:flex;align-items:center;justify-content:center;height:100%;color:#9ca3af;font-size:12px;padding:8px">${isPhoto ? '🖼 photo' : '▶ video'}</a>`;
   const desc = (ml && ml.description)
     ? `<div style="font-size:11px;color:#64748b;margin-top:4px;font-style:italic">${ml.description}</div>` : '';
   const modelName = ml
@@ -505,11 +554,17 @@ function renderCard(ev) {
   const human = ev.human
     ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${ev.human.labels.map(l=>`<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#dbeafe;color:#1d4ed8">${l}</span>`).join('')}</div>`
     : '';
+  const watchBtn = isPhoto ? '' : `<button onclick="toggleVideo(this.closest('.event-card'))" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">▶ Watch clip</button>`;
+  const player = isPhoto ? '' : `<div class="video-player hidden">
+        <video controls playsinline style="width:100%;display:block;max-height:400px;background:#000">
+          <source src="${ev.video_url}" type="video/mp4">
+        </video>
+      </div>`;
   return `
     <div class="event-card bg-white rounded-xl shadow-sm flex flex-col overflow-hidden border border-slate-200 border-l-4 ${border}"
          data-id="${ev.id}" data-classified="${ml ? 1 : 0}" data-video="${ev.video_url}">
       <div class="flex">
-        <div class="card-thumb flex-shrink-0 cursor-pointer" onclick="toggleVideo(this.closest('.event-card'))">${thumb}</div>
+        <div class="card-thumb flex-shrink-0 ${isPhoto ? '' : 'cursor-pointer'}" ${isPhoto ? '' : 'onclick="toggleVideo(this.closest(\'.event-card\'))"'}>${thumb}</div>
         <div class="p-4 flex-1 flex flex-col gap-1 min-w-0">
           <div class="flex items-start justify-between gap-2 flex-wrap">
             <div>
@@ -519,14 +574,10 @@ function renderCard(ev) {
             ${badge(ml)}
           </div>
           ${desc}${modelName}${human}
-          <button onclick="toggleVideo(this.closest('.event-card'))" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">▶ Watch clip</button>
+          ${watchBtn}
         </div>
       </div>
-      <div class="video-player hidden">
-        <video controls playsinline style="width:100%;display:block;max-height:400px;background:#000">
-          <source src="${ev.video_url}" type="video/mp4">
-        </video>
-      </div>
+      ${player}
     </div>`;
 }
 
@@ -550,6 +601,7 @@ function toggleVideo(card) {
 const POLL_INTERVAL = 30_000; // ms
 const activeFilter = new URLSearchParams(location.search).get('filter') || 'recent';
 const activeCamera = new URLSearchParams(location.search).get('camera') || '';
+const activeDescription = new URLSearchParams(location.search).get('description') || '';
 
 // Seed maxId from server-rendered cards
 let maxId = 0;
@@ -565,7 +617,7 @@ function getUnclassifiedIds() {
 async function poll() {
   try {
     // 1. Fetch any events newer than what we have
-    const newResp = await fetch(`/events?filter=${activeFilter}&camera=${encodeURIComponent(activeCamera)}&since_id=${maxId}`);
+    const newResp = await fetch(`/events?filter=${activeFilter}&camera=${encodeURIComponent(activeCamera)}&description=${encodeURIComponent(activeDescription)}&since_id=${maxId}`);
     const newData = await newResp.json();
     if (newData.events.length) {
       const list = document.getElementById('event-list');
@@ -606,10 +658,11 @@ document.getElementById('load-more-btn')?.addEventListener('click', async functi
   const page = parseInt(btn.dataset.page);
   const filter = btn.dataset.filter;
   const camera = btn.dataset.camera || '';
+  const description = btn.dataset.description || '';
   btn.textContent = 'Loading…';
   btn.disabled = true;
   try {
-    const resp = await fetch(`/events?page=${page}&filter=${filter}&camera=${encodeURIComponent(camera)}`);
+    const resp = await fetch(`/events?page=${page}&filter=${filter}&camera=${encodeURIComponent(camera)}&description=${encodeURIComponent(description)}`);
     const data = await resp.json();
     const list = document.getElementById('event-list');
     data.events.forEach(ev => list.insertAdjacentHTML('beforeend', renderCard(ev)));
@@ -648,13 +701,18 @@ _COMPARE_TEMPLATE = r"""<!DOCTYPE html>
   <a href="/watcher/browser" class="text-slate-400 hover:text-white text-sm">← Browser</a>
   <span class="text-lg font-semibold tracking-tight">📊 Model Comparison</span>
   <span class="text-slate-400 text-sm ml-2">{{ rows|length }} events · {{ models|length }} models</span>
-  <select class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none ml-auto"
-          onchange="location.href='?camera='+encodeURIComponent(this.value)">
+  <select class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"
+          data-description="{{ description }}"
+          onchange="location.href='?camera='+encodeURIComponent(this.value)+'&description='+encodeURIComponent(this.dataset.description)">
     <option value="">All cameras</option>
     {% for c in cameras %}
     <option value="{{ c }}" {% if camera == c %}selected{% endif %}>{{ c }}</option>
     {% endfor %}
   </select>
+  <input type="text" value="{{ description }}" placeholder="Filter by description…"
+         class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none w-48"
+         data-camera="{{ camera or '' }}"
+         onkeydown="if(event.key==='Enter'){location.href='?camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.value)}">
 </header>
 
 {% if not rows %}
@@ -683,19 +741,28 @@ _COMPARE_TEMPLATE = r"""<!DOCTYPE html>
     <td class="sticky left-0 bg-white px-3 py-2 z-10 shadow-[1px_0_0_0_#e2e8f0]">
       <div class="flex gap-2 items-start">
         {% if row.frame_url %}
-        <img src="{{ row.frame_url }}" class="thumb rounded cursor-pointer"
-             onclick="toggleVid(this, '{{ row.video_url }}')"
-             onerror="this.style.display='none'">
+          {% if row.is_photo %}
+          <a href="{{ row.video_url }}" target="_blank">
+            <img src="{{ row.frame_url }}" class="thumb rounded"
+                 onerror="this.style.display='none'">
+          </a>
+          {% else %}
+          <img src="{{ row.frame_url }}" class="thumb rounded cursor-pointer"
+               onclick="toggleVid(this, '{{ row.video_url }}')"
+               onerror="this.style.display='none'">
+          {% endif %}
         {% endif %}
         <div class="min-w-0">
           <div class="font-medium text-xs leading-tight">{{ row.capture_time }}</div>
           <div class="text-xs text-slate-400">{{ row.scene_name }}</div>
         </div>
       </div>
+      {% if not row.is_photo %}
       <video id="vid-{{ row.id }}" controls playsinline class="hidden mt-1 rounded"
              style="width:360px;max-height:600px">
         <source src="{{ row.video_url }}" type="video/mp4">
       </video>
+      {% endif %}
     </td>
 
     {# one column per model #}
