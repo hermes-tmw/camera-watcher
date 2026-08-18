@@ -195,7 +195,7 @@ def _counts(db_session):
 
 
 def _cameras(db_session):
-    """Distinct camera values, most-recent-first, for the filter dropdown."""
+    """Distinct camera values (alphabetical) for the filter dropdown."""
     rows = db_session.execute(
         select(EventObservation.camera)
         .where(EventObservation.camera.isnot(None))
@@ -278,11 +278,12 @@ def _compare_data(db_session, limit=50, camera=None):
 
     stmt = (_base_stmt()
             .where(EventObservation.id.in_(multi))
-            .where(EventObservation.capture_time >= _recent_cutoff())
-            .limit(limit))
+            .where(EventObservation.capture_time >= _recent_cutoff()))
 
     if camera:
         stmt = stmt.where(EventObservation.camera == camera)
+
+    stmt = stmt.limit(limit)
 
     events = db_session.execute(stmt).scalars().unique().all()
 
