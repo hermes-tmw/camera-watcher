@@ -20,12 +20,39 @@ from sqlalchemy.orm import sessionmaker, Session
 from watcher.model import WatcherBase
 from watcher.remote import APIUser, Base as RemoteBase
 
-_DEFAULT_TEST_URL = (
-    'postgresql+psycopg2://watcher:iquuvoaLi4woh3o@mira.local/watcher_test'
-)
+
+def _db_password_from_watcher_cfg() -> str:
+    """Read DB_PASS from the gitignored watcher.cfg (source of truth).
+
+    The test URL must never hardcode a password — the production credential
+    was once committed here and leaked to the public repo. Derive it from the
+    same gitignored config the running services use, or fall back to a
+    passwordless URL (peer auth) when the file is absent.
+    """
+    import configparser
+
+    path = os.environ.get("WATCHER_CONFIG", "")
+    if path and os.path.isfile(path):
+        try:
+            p = configparser.ConfigParser()
+            p.read(path)
+            pw = p["database"].get("DB_PASS", "")
+            if pw:
+                return pw
+        except (configparser.Error, KeyError):
+            pass
+    return ""
+
+
+def _default_test_url() -> str:
+    pw = _db_password_from_watcher_cfg()
+    if pw:
+        return f"postgresql+psycopg2://watcher:{pw}@mira.local/watcher_test"
+    return "postgresql+psycopg2://watcher@mira.local/watcher_test"
+
 
 def test_db_url() -> str:
-    return os.environ.get('TEST_DATABASE_URL', _DEFAULT_TEST_URL)
+    return os.environ.get("TEST_DATABASE_URL", _default_test_url())
 
 
 def make_test_engine():
