@@ -358,7 +358,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
   {% if cameras %}
   <select id="camera-select"
           class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"
-          onchange="location.href='?filter={{ filter }}&camera='+encodeURIComponent(this.value)">
+          data-filter="{{ filter }}"
+          onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.value)">
     <option value="">All cameras</option>
     {% for c in cameras %}
     <option value="{{ c }}" {% if camera == c %}selected{% endif %}>{{ c }}</option>
