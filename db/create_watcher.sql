@@ -80,6 +80,8 @@ ALTER TABLE motion_events
 
 ALTER TABLE event_observations ADD COLUMN IF NOT EXISTS lighting_type varchar(10);
 
+ALTER TABLE event_observations ADD COLUMN IF NOT EXISTS camera varchar(100);
+
 ALTER TABLE event_observations MODIFY COLUMN event_name VARCHAR(100);
 ALTER TABLE motion_events MODIFY COLUMN event_name VARCHAR(100);
 

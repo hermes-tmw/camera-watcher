@@ -104,6 +104,7 @@ def _serialize(event):
         'event_name':   event.event_name,
         'capture_time': _fmt_time(event.capture_time),
         'scene_name':   event.scene_name or '',
+        'camera':       event.camera or '',
         'lighting':     event.lighting_type or '',
         'video_url':    event.video_url,
         'frame_url':    event.significant_frame_url,
@@ -127,8 +128,11 @@ def _has_frame_subq():
     return select(IntermediateResult.event_id).correlate(EventObservation)
 
 
-def _fetch(db_session, page, filter_mode):
+def _fetch(db_session, page, filter_mode, camera=None):
     stmt = _base_stmt()
+
+    if camera:
+        stmt = stmt.where(EventObservation.camera == camera)
 
     if filter_mode == 'recent':
         stmt = stmt.where(EventObservation.capture_time >= _recent_cutoff())
@@ -190,6 +194,17 @@ def _counts(db_session):
     return dict(recent=recent, interesting=interesting, noise=noise, unclassified=unclassified)
 
 
+def _cameras(db_session):
+    """Distinct camera values (alphabetical) for the filter dropdown."""
+    rows = db_session.execute(
+        select(EventObservation.camera)
+        .where(EventObservation.camera.isnot(None))
+        .where(EventObservation.camera != '')
+        .distinct()
+    ).scalars().all()
+    return sorted({c for c in rows if c})
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
 
 @browser_bp.route('/browser')
@@ -198,9 +213,11 @@ def browser_page():
 
     filter_mode = request.args.get('filter', 'recent')
     page = request.args.get('page', 1, type=int)
+    camera = request.args.get('camera') or None
 
-    events, has_more = _fetch(db.session, page, filter_mode)
+    events, has_more = _fetch(db.session, page, filter_mode, camera)
     counts = _counts(db.session)
+    cameras = _cameras(db.session)
 
     return render_template_string(
         _TEMPLATE,
@@ -209,6 +226,8 @@ def browser_page():
         page=page,
         has_more=has_more,
         counts=counts,
+        cameras=cameras,
+        camera=camera,
         CATEGORY_ICON=CATEGORY_ICON,
         LIGHTING_LABEL=LIGHTING_LABEL,
     )
@@ -220,6 +239,7 @@ def events_json():
 
     filter_mode = request.args.get('filter', 'recent')
     page        = request.args.get('page', 1, type=int)
+    camera      = request.args.get('camera') or None
     since_id    = request.args.get('since_id', type=int)   # newer events only
     ids         = request.args.getlist('id', type=int)      # re-fetch specific events
 
@@ -235,16 +255,18 @@ def events_json():
         stmt = (_base_stmt()
                 .where(EventObservation.capture_time >= _recent_cutoff())
                 .where(EventObservation.id > since_id))
+        if camera:
+            stmt = stmt.where(EventObservation.camera == camera)
         rows = db.session.execute(stmt).scalars().unique().all()
         return jsonify({'events': [_serialize(e) for e in rows]})
 
-    events, has_more = _fetch(db.session, page, filter_mode)
+    events, has_more = _fetch(db.session, page, filter_mode, camera)
     return jsonify({'events': events, 'has_more': has_more, 'page': page})
 
 
 # ── compare route ────────────────────────────────────────────────────────────
 
-def _compare_data(db_session, limit=50):
+def _compare_data(db_session, limit=50, camera=None):
     """Return events that have ≥2 distinct ollama models, with per-model results."""
     from sqlalchemy import func
 
@@ -256,8 +278,12 @@ def _compare_data(db_session, limit=50):
 
     stmt = (_base_stmt()
             .where(EventObservation.id.in_(multi))
-            .where(EventObservation.capture_time >= _recent_cutoff())
-            .limit(limit))
+            .where(EventObservation.capture_time >= _recent_cutoff()))
+
+    if camera:
+        stmt = stmt.where(EventObservation.camera == camera)
+
+    stmt = stmt.limit(limit)
 
     events = db_session.execute(stmt).scalars().unique().all()
 
@@ -298,8 +324,11 @@ def _compare_data(db_session, limit=50):
 @browser_bp.route('/compare')
 def compare_page():
     from api import db
-    rows, models = _compare_data(db.session)
+    camera = request.args.get('camera') or None
+    rows, models = _compare_data(db.session, camera=camera)
+    cameras = _cameras(db.session)
     return render_template_string(_COMPARE_TEMPLATE, rows=rows, models=models,
+                                  camera=camera, cameras=cameras,
                                   CATEGORY_ICON=CATEGORY_ICON)
 
 
@@ -327,6 +356,17 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <header class="bg-slate-900 text-white px-5 py-3 flex flex-wrap items-center gap-3 sticky top-0 z-10 shadow">
   <span class="text-lg font-semibold tracking-tight">📷 Camera Events</span>
   <a href="/watcher/compare" class="text-slate-400 hover:text-white text-sm ml-2">Compare ↗</a>
+  {% if cameras %}
+  <select id="camera-select"
+          class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"
+          data-filter="{{ filter }}"
+          onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.value)">
+    <option value="">All cameras</option>
+    {% for c in cameras %}
+    <option value="{{ c }}" {% if camera == c %}selected{% endif %}>{{ c }}</option>
+    {% endfor %}
+  </select>
+  {% endif %}
   <nav class="flex gap-1 ml-auto flex-wrap">
     {% set tabs = [
         ('recent',       'Recent',       counts.recent),
@@ -335,7 +375,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
         ('unclassified', 'Needs Review', counts.unclassified),
     ] %}
     {% for f, label, count in tabs %}
-    <a href="?filter={{ f }}"
+    <a href="?filter={{ f }}{% if camera %}&camera={{ camera }}{% endif %}"
        class="px-3 py-1 rounded-full text-sm transition-colors flex items-center gap-1
               {% if filter == f %}bg-white text-slate-900 font-medium
               {% else %}text-slate-300 hover:bg-slate-700{% endif %}">
@@ -432,7 +472,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <div class="text-center py-6" id="load-more-wrap">
   <button id="load-more-btn"
           class="px-6 py-2 bg-slate-800 text-white text-sm rounded-full hover:bg-slate-700 transition-colors"
-          data-page="{{ page + 1 }}" data-filter="{{ filter }}">
+          data-page="{{ page + 1 }}" data-filter="{{ filter }}" data-camera="{{ camera or '' }}">
     Load more
   </button>
 </div>
@@ -509,6 +549,7 @@ function toggleVideo(card) {
 
 const POLL_INTERVAL = 30_000; // ms
 const activeFilter = new URLSearchParams(location.search).get('filter') || 'recent';
+const activeCamera = new URLSearchParams(location.search).get('camera') || '';
 
 // Seed maxId from server-rendered cards
 let maxId = 0;
@@ -524,7 +565,7 @@ function getUnclassifiedIds() {
 async function poll() {
   try {
     // 1. Fetch any events newer than what we have
-    const newResp = await fetch(`/events?filter=${activeFilter}&since_id=${maxId}`);
+    const newResp = await fetch(`/events?filter=${activeFilter}&camera=${encodeURIComponent(activeCamera)}&since_id=${maxId}`);
     const newData = await newResp.json();
     if (newData.events.length) {
       const list = document.getElementById('event-list');
@@ -564,10 +605,11 @@ document.getElementById('load-more-btn')?.addEventListener('click', async functi
   const btn = this;
   const page = parseInt(btn.dataset.page);
   const filter = btn.dataset.filter;
+  const camera = btn.dataset.camera || '';
   btn.textContent = 'Loading…';
   btn.disabled = true;
   try {
-    const resp = await fetch(`/events?page=${page}&filter=${filter}`);
+    const resp = await fetch(`/events?page=${page}&filter=${filter}&camera=${encodeURIComponent(camera)}`);
     const data = await resp.json();
     const list = document.getElementById('event-list');
     data.events.forEach(ev => list.insertAdjacentHTML('beforeend', renderCard(ev)));
@@ -606,6 +648,13 @@ _COMPARE_TEMPLATE = r"""<!DOCTYPE html>
   <a href="/watcher/browser" class="text-slate-400 hover:text-white text-sm">← Browser</a>
   <span class="text-lg font-semibold tracking-tight">📊 Model Comparison</span>
   <span class="text-slate-400 text-sm ml-2">{{ rows|length }} events · {{ models|length }} models</span>
+  <select class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none ml-auto"
+          onchange="location.href='?camera='+encodeURIComponent(this.value)">
+    <option value="">All cameras</option>
+    {% for c in cameras %}
+    <option value="{{ c }}" {% if camera == c %}selected{% endif %}>{{ c }}</option>
+    {% endfor %}
+  </select>
 </header>
 
 {% if not rows %}

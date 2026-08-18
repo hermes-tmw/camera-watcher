@@ -3,9 +3,7 @@ FROM python:3-bookworm
 
 ## OS dependencies
 
-RUN apt-get update
-
-RUN apt-get -y install autoconf automake libtool \
+RUN apt-get update && apt-get -y install autoconf automake libtool \
 autopoint libjpeg-dev libmicrohttpd-dev \
 libavutil-dev libavformat-dev libavcodec-dev libswscale-dev libavdevice-dev \
 ffmpeg 
