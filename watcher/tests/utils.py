@@ -21,7 +21,7 @@ from watcher.model import WatcherBase
 from watcher.remote import APIUser, Base as RemoteBase
 
 _DEFAULT_TEST_URL = (
-    'postgresql+psycopg2://watcher:iquuvoaLi4woh3o@mira.local/watcher_test'
+    'postgresql+psycopg2://watcher:CHANGE_ME@mira.local/watcher_test'
 )
 
 def test_db_url() -> str:
