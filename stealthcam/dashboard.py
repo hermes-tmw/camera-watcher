@@ -71,11 +71,11 @@ class DashboardWriter:
             cur.execute(
                 "INSERT INTO event_observations "
                 "(event_name, video_file, capture_time, scene_name, storage_local, "
-                " video_location, lighting_type) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                " video_location, lighting_type, camera) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (event_name) DO NOTHING RETURNING id",
                 (event_name, video_file, capture_time, direction, True,
-                 video_location, lighting),
+                 video_location, lighting, "stealthcam"),
             )
             row = cur.fetchone()
             if row is None:

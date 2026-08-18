@@ -40,6 +40,7 @@ class EventObservation(WatcherBase):
     threshold: Mapped[Optional[int]] = mapped_column()
     noise_level: Mapped[Optional[int]] = mapped_column()
     lighting_type: Mapped[Optional[str]] = mapped_column()
+    camera: Mapped[Optional[str]] = mapped_column()
 
     classifications: Mapped[List['EventClassification']] = relationship(back_populates='observation', )
     computations: Mapped[List['Computation']] = relationship()
@@ -114,6 +115,11 @@ class EventObservation(WatcherBase):
         self.capture_time = datetime.fromisoformat(timestr).astimezone(camera_timezone)
         self.scene_name = input.get('scene_name',"")
         self.event_name = input.get('event_name',"")
+        # camera identifies the physical camera that produced this event. It
+        # defaults to scene_name (the motion camera's instance name) so the
+        # existing ingestion needs no change; the stealthcam pipeline sets it
+        # explicitly (scene_name there is a compass direction, not a camera).
+        self.camera = input.get('camera') or input.get('scene_name', '')
 
         lat=config['location'].get('LATITUDE')
         lng=config['location'].get('LONGITUDE') 
