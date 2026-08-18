@@ -1,7 +1,7 @@
 FROM python:3-bookworm
 
 ## OS dependencies
-RUN apt-get update && apt-get -y install sqlite3 redis
+RUN apt-get update && apt-get -y install sqlite3 redis libgl1 libglib2.0-0
 
 ## python requirements — CPU torch first (no nvidia-container-toolkit on this
 ## host; YOLO11n runs CPU in-container, VLM goes to host ollama), then
