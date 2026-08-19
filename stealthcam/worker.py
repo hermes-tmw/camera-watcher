@@ -141,31 +141,45 @@ def backfill(cfg, client: StealthcamClient, detector: Detector, memory: Memory,
     Pages back through images-list and processes captures in baseline mode so
     persistent objects (parked tractor/car) are already "static" before the
     live loop starts. Returns the number of captures backfilled.
+
+    Captures are processed in CHRONOLOGICAL order (oldest first). The
+    images-list endpoint returns newest-first, and static detection measures
+    persistence as (capture_count >= N) AND (span >= M hours) keyed on each
+    capture's own `createdDateTime`. Processing newest-first means the first
+    sighting of a persistent object is recorded with a *recent* timestamp, so
+    the span never reaches M hours and the object is re-alerted as "novel" on
+    every capture (the parked-tractor bug). Sorting oldest-first makes the
+    first sighting carry the earliest timestamp, so the span grows correctly
+    and the object converges to static.
     """
     log.info("backfill: seeding baseline (up to %d captures)", max_captures)
-    processed = 0
+    captures: list[dict] = []
     cursor = None
-    while processed < max_captures:
+    while len(captures) < max_captures:
         images = client.list_images(take_count=50, cursor=cursor)
         if not images:
             break
-        for capture in images:
-            if processed >= max_captures:
-                break
-            if memory.has_seen(capture["imageGuid"]):
-                continue
-            try:
-                process_capture(capture, client, detector, None, memory, None, None,
-                                subimage_dir, baseline_mode=True)
-                processed += 1
-            except Exception as e:
-                log.error("backfill capture %s failed: %s", capture["imageGuid"], e)
+        captures.extend(images)
         cursor = {
             "createdDateTime": images[-1]["createdDateTime"],
             "uploadedDateTime": images[-1].get("uploadedTime"),
         }
         if len(images) < 50:
             break
+    # oldest-first so persistence spans grow correctly (see docstring).
+    captures.sort(key=lambda c: c.get("createdDateTime", ""))
+    captures = captures[:max_captures]
+
+    processed = 0
+    for capture in captures:
+        if memory.has_seen(capture["imageGuid"]):
+            continue
+        try:
+            process_capture(capture, client, detector, None, memory, None, None,
+                            subimage_dir, baseline_mode=True)
+            processed += 1
+        except Exception as e:
+            log.error("backfill capture %s failed: %s", capture["imageGuid"], e)
     log.info("backfill done: %d captures", processed)
     return processed
 
