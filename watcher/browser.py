@@ -1042,8 +1042,24 @@ setInterval(poll, POLL_INTERVAL);
 // ── infinite scroll ──────────────────────────────────────────────────────────
 // When the sentinel scrolls into view, fetch the next page and append it.
 // The sentinel is re-armed with the next page number until has_more is false.
+//
+// Loading is driven by an explicit position check (sentinelInView) that runs on
+// scroll AND after every load, with IntersectionObserver kept as an extra
+// trigger. This is deliberate: IntersectionObserver alone is unreliable here —
+// (a) browsers suppress IO callbacks while the tab is hidden/backgrounded, and
+// (b) IO only fires on intersection *changes*, so if the sentinel is already in
+// view when a page finishes loading (short cards / tall viewport) no further
+// callback fires and loading stalls. The position check covers both cases.
 
 let loading = false;
+
+function sentinelInView() {
+  const sentinel = document.getElementById('scroll-sentinel');
+  if (!sentinel) return false;
+  const r = sentinel.getBoundingClientRect();
+  const margin = 200; // px — match the IO rootMargin
+  return r.top < window.innerHeight + margin && r.bottom > -margin;
+}
 
 async function loadMore() {
   const sentinel = document.getElementById('scroll-sentinel');
@@ -1073,19 +1089,35 @@ async function loadMore() {
     if (label) label.textContent = 'Error — scroll to retry';
   } finally {
     loading = false;
+    // If the sentinel is still in view after this page (short cards / tall
+    // viewport), keep loading until it scrolls out of view or has_more is false.
+    if (sentinelInView()) loadMore();
   }
 }
 
 const sentinel = document.getElementById('scroll-sentinel');
-if (sentinel && 'IntersectionObserver' in window) {
-  const observer = new IntersectionObserver((entries) => {
-    if (entries.some(e => e.isIntersecting)) loadMore();
-  }, {rootMargin: '200px'});
-  observer.observe(sentinel);
-} else if (sentinel) {
-  // Fallback: keep the sentinel clickable if IntersectionObserver is unavailable.
-  sentinel.style.cursor = 'pointer';
-  sentinel.addEventListener('click', loadMore);
+if (sentinel) {
+  // Primary trigger: explicit position check on scroll (fires even in hidden
+  // tabs, unlike IntersectionObserver).
+  window.addEventListener('scroll', () => {
+    if (sentinelInView()) loadMore();
+  }, {passive: true});
+
+  // Extra trigger: IntersectionObserver, when available.
+  if ('IntersectionObserver' in window) {
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some(e => e.isIntersecting)) loadMore();
+    }, {rootMargin: '200px'});
+    observer.observe(sentinel);
+  } else {
+    // Fallback: keep the sentinel clickable if IntersectionObserver is unavailable.
+    sentinel.style.cursor = 'pointer';
+    sentinel.addEventListener('click', loadMore);
+  }
+
+  // Initial check: if the sentinel is already in view on first paint (e.g. a
+  // short first page), start loading immediately.
+  if (sentinelInView()) loadMore();
 }
 </script>
 </body>

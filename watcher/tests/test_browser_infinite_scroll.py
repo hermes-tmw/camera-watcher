@@ -62,6 +62,12 @@ class TestBrowserInfiniteScroll(unittest.TestCase):
         self.assertIn('data-page="2"', html)
         self.assertIn('IntersectionObserver', html)
         self.assertNotIn('load-more-btn', html)
+        # The observer alone is unreliable (suppressed in hidden tabs, and only
+        # fires on intersection *changes*), so loading is driven by an explicit
+        # position check on scroll + after each load. Pin that contract.
+        self.assertIn('function sentinelInView()', html)
+        self.assertIn("window.addEventListener('scroll'", html)
+        self.assertIn('if (sentinelInView()) loadMore()', html)
         # The app is served under /watcher (nginx rewrites /watcher/* -> /*).
         # Every fetch() must carry the prefix or it 404s against nginx's
         # static `location /`. Pin the API_BASE constant and that no bare
