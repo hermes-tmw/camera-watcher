@@ -20,7 +20,7 @@ from .output import get_local_time_iso
 from .connection import application_config, in_docker, application_path_for
 from .outdoors import sunlight_from_time_for_location
 
-__all__ = ['EventObservation', 'EventClassification', 'Computation', 'Labeling', 'IntermediateResult']
+__all__ = ['EventObservation', 'EventClassification', 'Computation', 'Labeling', 'IntermediateResult', 'StealthcamFeedback']
 
 config = application_config()
 class WatcherBase(DeclarativeBase):
@@ -47,6 +47,7 @@ class EventObservation(WatcherBase):
 
     labelings: Mapped[List['Labeling']] = relationship("Labeling", back_populates="event")
     results: Mapped[List['IntermediateResult']] = relationship("IntermediateResult", back_populates="event")
+    feedback: Mapped[List['StealthcamFeedback']] = relationship("StealthcamFeedback", back_populates="event")
  
     @classmethod
     def uncategorized(cls, session, before: datetime=None, limit: int=1,
@@ -405,3 +406,28 @@ class IntermediateResult(WatcherBase):
     @property
     def absolute_path(self):
         return application_path_for(self.file)
+
+
+class StealthcamFeedback(WatcherBase):
+    """Human 👍/👎 feedback on a dashboard event (feedback-loop data).
+
+    One row per event (UNIQUE event_id): the dashboard's 👍/👎 buttons are
+    toggles, so a single row is upserted on toggle and deleted on undo.
+    `label` is 'good' (👍) or 'bad' (👎); `reason` is the free-text the user
+    supplies when marking an event bad (the high-value signal for agent
+    self-improvement).
+    """
+    __tablename__ = 'stealthcam_feedback'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey('event_observations.id'), nullable=False, unique=True)
+    label: Mapped[str] = mapped_column()          # 'good' | 'bad'
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column()
+
+    event: Mapped['EventObservation'] = relationship(back_populates='feedback')
+
+    def __init__(self, **input):
+        super().__init__(**input)
+        if not self.created_at:
+            self.created_at = datetime.now()

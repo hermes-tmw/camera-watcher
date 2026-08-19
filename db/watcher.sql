@@ -97,3 +97,12 @@ CREATE TABLE labelings (
     PRIMARY KEY (id), 
     FOREIGN KEY(event_id) REFERENCES event_observations (id)
 );
+CREATE TABLE stealthcam_feedback (
+    id INTEGER NOT NULL,
+    event_id INTEGER NOT NULL UNIQUE,
+    label VARCHAR NOT NULL,
+    reason TEXT,
+    created_at DATETIME NOT NULL,
+    PRIMARY KEY (id),
+    FOREIGN KEY(event_id) REFERENCES event_observations (id)
+);
