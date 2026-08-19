@@ -602,12 +602,9 @@ _TEMPLATE = r"""<!DOCTYPE html>
 </main>
 
 {% if has_more %}
-<div class="text-center py-6" id="load-more-wrap">
-  <button id="load-more-btn"
-          class="px-6 py-2 bg-slate-800 text-white text-sm rounded-full hover:bg-slate-700 transition-colors"
-          data-page="{{ page + 1 }}" data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}">
-    Load more
-  </button>
+<div id="scroll-sentinel" class="py-6 text-center text-slate-400 text-sm"
+     data-page="{{ page + 1 }}" data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}">
+  <span id="scroll-sentinel-label">Loading…</span>
 </div>
 {% endif %}
 
@@ -823,31 +820,54 @@ setInterval(poll, POLL_INTERVAL);
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-document.getElementById('load-more-btn')?.addEventListener('click', async function() {
-  const btn = this;
-  const page = parseInt(btn.dataset.page);
-  const filter = btn.dataset.filter;
-  const camera = btn.dataset.camera || '';
-  const description = btn.dataset.description || '';
-  btn.textContent = 'Loading…';
-  btn.disabled = true;
+// ── infinite scroll ──────────────────────────────────────────────────────────
+// When the sentinel scrolls into view, fetch the next page and append it.
+// The sentinel is re-armed with the next page number until has_more is false.
+
+let loading = false;
+
+async function loadMore() {
+  const sentinel = document.getElementById('scroll-sentinel');
+  if (!sentinel || loading) return;
+  loading = true;
+  const page = parseInt(sentinel.dataset.page);
+  const filter = sentinel.dataset.filter;
+  const camera = sentinel.dataset.camera || '';
+  const description = sentinel.dataset.description || '';
+  const label = document.getElementById('scroll-sentinel-label');
+  if (label) label.textContent = 'Loading…';
   try {
     const resp = await fetch(`/events?page=${page}&filter=${filter}&camera=${encodeURIComponent(camera)}&description=${encodeURIComponent(description)}`);
     const data = await resp.json();
     const list = document.getElementById('event-list');
-    data.events.forEach(ev => list.insertAdjacentHTML('beforeend', renderCard(ev)));
+    data.events.forEach(ev => {
+      list.insertAdjacentHTML('beforeend', renderCard(ev));
+      maxId = Math.max(maxId, ev.id);
+    });
     if (data.has_more) {
-      btn.dataset.page = page + 1;
-      btn.textContent = 'Load more';
-      btn.disabled = false;
+      sentinel.dataset.page = page + 1;
+      if (label) label.textContent = 'Scroll for more…';
     } else {
-      document.getElementById('load-more-wrap').remove();
+      sentinel.remove();
     }
   } catch(e) {
-    btn.textContent = 'Error — try again';
-    btn.disabled = false;
+    if (label) label.textContent = 'Error — scroll to retry';
+  } finally {
+    loading = false;
   }
-});
+}
+
+const sentinel = document.getElementById('scroll-sentinel');
+if (sentinel && 'IntersectionObserver' in window) {
+  const observer = new IntersectionObserver((entries) => {
+    if (entries.some(e => e.isIntersecting)) loadMore();
+  }, {rootMargin: '200px'});
+  observer.observe(sentinel);
+} else if (sentinel) {
+  // Fallback: keep the sentinel clickable if IntersectionObserver is unavailable.
+  sentinel.style.cursor = 'pointer';
+  sentinel.addEventListener('click', loadMore);
+}
 </script>
 </body>
 </html>"""
