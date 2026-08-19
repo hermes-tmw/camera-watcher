@@ -5,7 +5,7 @@ from flask import Blueprint, render_template_string, request, jsonify
 from sqlalchemy import select, desc, func, exists, Text
 from sqlalchemy.orm import joinedload
 
-from .model import EventObservation, Labeling, IntermediateResult
+from .model import EventObservation, Labeling, IntermediateResult, StealthcamFeedback
 from .connection import application_config
 
 __all__ = ['browser_bp']
@@ -122,6 +122,14 @@ def _human_info(event):
     return {'labels': lbl.labels, 'decider': lbl.decider}
 
 
+def _feedback_info(event):
+    """Current 👍/👎 feedback for this event, if any (toggle state)."""
+    fb = next((f for f in event.feedback), None)
+    if not fb:
+        return None
+    return {'label': fb.label, 'reason': fb.reason or ''}
+
+
 def _serialize(event):
     return {
         'id':           event.id,
@@ -135,6 +143,7 @@ def _serialize(event):
         'is_photo':     _is_photo(event),
         'ml':           _ml_info(event),
         'human':        _human_info(event),
+        'feedback':     _feedback_info(event),
     }
 
 
@@ -145,7 +154,8 @@ def _recent_cutoff():
 def _base_stmt():
     return (select(EventObservation)
             .options(joinedload(EventObservation.labelings),
-                     joinedload(EventObservation.results))
+                     joinedload(EventObservation.results),
+                     joinedload(EventObservation.feedback))
             .order_by(desc(EventObservation.capture_time)))
 
 
@@ -295,6 +305,59 @@ def events_json():
 
     events, has_more = _fetch(db.session, page, filter_mode, camera, description)
     return jsonify({'events': events, 'has_more': has_more, 'page': page})
+
+
+# ── feedback route ───────────────────────────────────────────────────────────
+
+@browser_bp.route('/feedback', methods=['POST'])
+def feedback():
+    """Set/clear 👍/👎 feedback on an event (toggle semantics).
+
+    Body: {event_id, label: 'good'|'bad', reason?: str}. One row per event
+    (UNIQUE event_id): setting the same label again is an undo (row deleted);
+    setting the other label replaces it. Returns the new feedback state.
+    """
+    from api import db
+
+    data = request.get_json(silent=True) or {}
+    event_id = data.get('event_id')
+    label = data.get('label')
+    reason = (data.get('reason') or '').strip()
+
+    if label not in ('good', 'bad'):
+        return jsonify({'error': "label must be 'good' or 'bad'"}), 400
+
+    if event_id is None:
+        return jsonify({'error': 'event_id is required'}), 400
+    try:
+        event_id = int(event_id)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'event_id must be an integer'}), 400
+
+    event = db.session.get(EventObservation, event_id)
+    if event is None:
+        return jsonify({'error': 'event not found'}), 404
+
+    existing = db.session.execute(
+        select(StealthcamFeedback).where(StealthcamFeedback.event_id == event_id)
+    ).scalar_one_or_none()
+
+    if existing is not None and existing.label == label:
+        # Same label again = undo (toggle off).
+        db.session.delete(existing)
+        db.session.commit()
+        return jsonify({'feedback': None})
+
+    if existing is not None:
+        # Switching label (👍 -> 👎 or vice versa).
+        existing.label = label
+        existing.reason = reason or None
+        existing.created_at = datetime.now()
+    else:
+        db.session.add(StealthcamFeedback(event_id=event_id, label=label, reason=reason or None))
+    db.session.commit()
+
+    return jsonify({'feedback': {'label': label, 'reason': reason}}), 201
 
 
 # ── compare route ────────────────────────────────────────────────────────────
@@ -492,6 +555,18 @@ _TEMPLATE = r"""<!DOCTYPE html>
         </div>
         {% endif %}
 
+        <div class="flex items-center gap-1 mt-1" data-feedback-row>
+          <button data-fb="good" onclick="toggleFeedback(this, 'good')"
+                  class="fb-btn px-1.5 py-0.5 rounded text-sm leading-none transition-colors
+                         {% if ev.feedback and ev.feedback.label == 'good' %}fb-active bg-green-200 ring-1 ring-green-400{% else %}bg-slate-100 hover:bg-slate-200{% endif %}">👍</button>
+          <button data-fb="bad" onclick="toggleFeedback(this, 'bad')"
+                  class="fb-btn px-1.5 py-0.5 rounded text-sm leading-none transition-colors
+                         {% if ev.feedback and ev.feedback.label == 'bad' %}fb-active bg-red-200 ring-1 ring-red-400{% else %}bg-slate-100 hover:bg-slate-200{% endif %}">👎</button>
+          {% if ev.feedback and ev.feedback.reason %}
+          <span class="text-xs text-slate-400 italic" data-fb-reason>{{ ev.feedback.reason }}</span>
+          {% endif %}
+        </div>
+
         {% if not ev.is_photo %}
         <button onclick="toggleVideo(this.closest('.event-card'))"
                 class="mt-auto pt-2 text-xs text-blue-500 hover:text-blue-700 hover:underline w-fit text-left">
@@ -554,6 +629,17 @@ function renderCard(ev) {
   const human = ev.human
     ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${ev.human.labels.map(l=>`<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#dbeafe;color:#1d4ed8">${l}</span>`).join('')}</div>`
     : '';
+  const fb = ev.feedback;
+  const fbGood = fb && fb.label === 'good' ? 'background:#bbf7d0;box-shadow:0 0 0 1px #4ade80' : 'background:#f1f5f9';
+  const fbBad  = fb && fb.label === 'bad'  ? 'background:#fecaca;box-shadow:0 0 0 1px #f87171' : 'background:#f1f5f9';
+  const fbGoodCls = fb && fb.label === 'good' ? ' fb-active' : '';
+  const fbBadCls  = fb && fb.label === 'bad'  ? ' fb-active' : '';
+  const fbReason = (fb && fb.reason) ? `<span style="font-size:11px;color:#94a3b8;font-style:italic" data-fb-reason>${fb.reason}</span>` : '';
+  const feedbackRow = `<div style="display:flex;align-items:center;gap:4px;margin-top:4px" data-feedback-row>
+      <button data-fb="good" onclick="toggleFeedback(this,'good')" class="fb-btn${fbGoodCls}" style="font-size:14px;line-height:1;padding:2px 6px;border-radius:4px;border:none;cursor:pointer;${fbGood}">👍</button>
+      <button data-fb="bad" onclick="toggleFeedback(this,'bad')" class="fb-btn${fbBadCls}" style="font-size:14px;line-height:1;padding:2px 6px;border-radius:4px;border:none;cursor:pointer;${fbBad}">👎</button>
+      ${fbReason}
+    </div>`;
   const watchBtn = isPhoto ? '' : `<button onclick="toggleVideo(this.closest('.event-card'))" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">▶ Watch clip</button>`;
   const player = isPhoto ? '' : `<div class="video-player hidden">
         <video controls playsinline style="width:100%;display:block;max-height:400px;background:#000">
@@ -573,7 +659,7 @@ function renderCard(ev) {
             </div>
             ${badge(ml)}
           </div>
-          ${desc}${modelName}${human}
+          ${desc}${modelName}${human}${feedbackRow}
           ${watchBtn}
         </div>
       </div>
@@ -593,6 +679,69 @@ function toggleVideo(card) {
     video.pause();
     video.currentTime = 0;
     player.classList.add('hidden');
+  }
+}
+
+// ── feedback toggles ─────────────────────────────────────────────────────────
+
+async function toggleFeedback(btn, label) {
+  const card = btn.closest('.event-card');
+  const eventId = parseInt(card.dataset.id);
+  const row = card.querySelector('[data-feedback-row]');
+  const goodBtn = row.querySelector('[data-fb="good"]');
+  const badBtn  = row.querySelector('[data-fb="bad"]');
+  const reasonEl = row.querySelector('[data-fb-reason]');
+
+  // If the clicked button is already active, this is an undo — no reason needed.
+  const isUndo = btn.classList.contains('fb-active');
+
+  let reason = '';
+  if (label === 'bad' && !isUndo) {
+    reason = prompt('Why is this wrong? (helps the agent improve)');
+    if (reason === null) return; // cancelled
+  }
+
+  try {
+    const resp = await fetch('/feedback', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({event_id: eventId, label: label, reason: reason}),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      alert('Feedback failed: ' + (err.error || resp.status));
+      return;
+    }
+    const data = await resp.json();
+    applyFeedbackState(row, data.feedback);
+  } catch (e) {
+    alert('Feedback failed: network error');
+  }
+}
+
+function applyFeedbackState(row, fb) {
+  const goodBtn = row.querySelector('[data-fb="good"]');
+  const badBtn  = row.querySelector('[data-fb="bad"]');
+  const reasonEl = row.querySelector('[data-fb-reason]');
+
+  const active = fb ? fb.label : null;
+  goodBtn.classList.toggle('fb-active', active === 'good');
+  badBtn.classList.toggle('fb-active', active === 'bad');
+  // Clear server-rendered Tailwind classes so inline styles are authoritative.
+  goodBtn.classList.remove('bg-green-200', 'ring-1', 'ring-green-400', 'bg-slate-100', 'hover:bg-slate-200');
+  badBtn.classList.remove('bg-red-200', 'ring-1', 'ring-red-400', 'bg-slate-100', 'hover:bg-slate-200');
+  goodBtn.style.background = active === 'good' ? '#bbf7d0' : '#f1f5f9';
+  goodBtn.style.boxShadow = active === 'good' ? '0 0 0 1px #4ade80' : 'none';
+  badBtn.style.background  = active === 'bad'  ? '#fecaca' : '#f1f5f9';
+  badBtn.style.boxShadow  = active === 'bad'  ? '0 0 0 1px #f87171' : 'none';
+
+  if (reasonEl) reasonEl.remove();
+  if (fb && fb.reason) {
+    const span = document.createElement('span');
+    span.dataset.fbReason = '';
+    span.style.cssText = 'font-size:11px;color:#94a3b8;font-style:italic';
+    span.textContent = fb.reason;
+    row.appendChild(span);
   }
 }
 
