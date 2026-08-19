@@ -442,12 +442,12 @@ _TEMPLATE = r"""<!DOCTYPE html>
        data-id="{{ ev.id }}" data-classified="{{ '1' if ml else '0' }}" data-video="{{ ev.video_url }}">
 
     <div class="flex">
-      <div class="card-thumb flex-shrink-0 {% if not ev.is_photo %}cursor-pointer{% endif %}" {% if not ev.is_photo %}onclick="toggleVideo(this.closest('.event-card'))"{% endif %}>
+      <div class="card-thumb flex-shrink-0 cursor-pointer" onclick="toggleMedia(this.closest('.event-card'))">
         {% if ev.frame_url %}
         <img src="{{ ev.frame_url }}" alt="frame" loading="lazy"
              onerror="this.closest('.card-thumb').innerHTML='<div class=\'flex items-center justify-center h-full text-slate-400 text-xs p-2\'>no frame</div>'">
         {% else %}
-        <div class="flex items-center justify-center h-full text-slate-400 text-xs p-2">▶ video</div>
+        <div class="flex items-center justify-center h-full text-slate-400 text-xs p-2">{% if ev.is_photo %}🖼 photo{% else %}▶ video{% endif %}</div>
         {% endif %}
       </div>
 
@@ -492,8 +492,13 @@ _TEMPLATE = r"""<!DOCTYPE html>
         </div>
         {% endif %}
 
-        {% if not ev.is_photo %}
-        <button onclick="toggleVideo(this.closest('.event-card'))"
+        {% if ev.is_photo %}
+        <button onclick="toggleMedia(this.closest('.event-card'))"
+                class="mt-auto pt-2 text-xs text-blue-500 hover:text-blue-700 hover:underline w-fit text-left">
+          🔍 Enlarge
+        </button>
+        {% else %}
+        <button onclick="toggleMedia(this.closest('.event-card'))"
                 class="mt-auto pt-2 text-xs text-blue-500 hover:text-blue-700 hover:underline w-fit text-left">
           ▶ Watch clip
         </button>
@@ -501,7 +506,12 @@ _TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    {% if not ev.is_photo %}
+    {% if ev.is_photo %}
+    <div class="photo-player hidden">
+      <img src="{{ ev.frame_url }}" alt="enlarged frame" loading="lazy"
+           style="width:100%;display:block;max-height:600px;object-fit:contain;background:#000">
+    </div>
+    {% else %}
     <div class="video-player hidden">
       <video controls playsinline style="width:100%;display:block;max-height:400px;background:#000">
         <source src="{{ ev.video_url }}" type="video/mp4">
@@ -545,8 +555,8 @@ function renderCard(ev) {
   const border = ml ? (ml.interesting ? 'border-l-green-400' : 'border-l-slate-300') : 'border-l-amber-300';
   const lighting = ev.lighting ? ` · ${LIGHTING_LABEL[ev.lighting] || ''} ${ev.lighting}` : '';
   const thumb = ev.frame_url
-    ? `<a href="${ev.video_url}" target="_blank"><img src="${ev.frame_url}" loading="lazy" style="width:192px;height:108px;object-fit:cover;display:block" onerror="this.closest('.card-thumb').innerHTML='<div style=padding:8px;color:#9ca3af;font-size:12px>no frame</div>'"></a>`
-    : `<a href="${ev.video_url}" target="_blank" style="display:flex;align-items:center;justify-content:center;height:100%;color:#9ca3af;font-size:12px;padding:8px">${isPhoto ? '🖼 photo' : '▶ video'}</a>`;
+    ? `<img src="${ev.frame_url}" loading="lazy" style="width:192px;height:108px;object-fit:cover;display:block" onerror="this.closest('.card-thumb').innerHTML='<div style=padding:8px;color:#9ca3af;font-size:12px>no frame</div>'">`
+    : `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#9ca3af;font-size:12px;padding:8px">${isPhoto ? '🖼 photo' : '▶ video'}</div>`;
   const desc = (ml && ml.description)
     ? `<div style="font-size:11px;color:#64748b;margin-top:4px;font-style:italic">${ml.description}</div>` : '';
   const modelName = ml
@@ -554,8 +564,14 @@ function renderCard(ev) {
   const human = ev.human
     ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${ev.human.labels.map(l=>`<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:#dbeafe;color:#1d4ed8">${l}</span>`).join('')}</div>`
     : '';
-  const watchBtn = isPhoto ? '' : `<button onclick="toggleVideo(this.closest('.event-card'))" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">▶ Watch clip</button>`;
-  const player = isPhoto ? '' : `<div class="video-player hidden">
+  const watchBtn = isPhoto
+    ? `<button onclick="toggleMedia(this.closest('.event-card'))" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">🔍 Enlarge</button>`
+    : `<button onclick="toggleMedia(this.closest('.event-card'))" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">▶ Watch clip</button>`;
+  const player = isPhoto
+    ? `<div class="photo-player hidden">
+        <img src="${ev.frame_url}" alt="enlarged frame" loading="lazy" style="width:100%;display:block;max-height:600px;object-fit:contain;background:#000">
+      </div>`
+    : `<div class="video-player hidden">
         <video controls playsinline style="width:100%;display:block;max-height:400px;background:#000">
           <source src="${ev.video_url}" type="video/mp4">
         </video>
@@ -564,7 +580,7 @@ function renderCard(ev) {
     <div class="event-card bg-white rounded-xl shadow-sm flex flex-col overflow-hidden border border-slate-200 border-l-4 ${border}"
          data-id="${ev.id}" data-classified="${ml ? 1 : 0}" data-video="${ev.video_url}">
       <div class="flex">
-        <div class="card-thumb flex-shrink-0 ${isPhoto ? '' : 'cursor-pointer'}" ${isPhoto ? '' : 'onclick="toggleVideo(this.closest(\'.event-card\'))"'}>${thumb}</div>
+        <div class="card-thumb flex-shrink-0 cursor-pointer" onclick="toggleMedia(this.closest('.event-card'))">${thumb}</div>
         <div class="p-4 flex-1 flex flex-col gap-1 min-w-0">
           <div class="flex items-start justify-between gap-2 flex-wrap">
             <div>
@@ -581,17 +597,18 @@ function renderCard(ev) {
     </div>`;
 }
 
-// ── inline video player ───────────────────────────────────────────────────────
+// ── inline media player (photo enlarge / video) ──────────────────────────────
 
-function toggleVideo(card) {
-  const player = card.querySelector('.video-player');
-  const video  = card.querySelector('video');
+function toggleMedia(card) {
+  const photo = card.querySelector('.photo-player');
+  const video = card.querySelector('.video-player');
+  const player = photo || video;
+  if (!player) return;
   if (player.classList.contains('hidden')) {
     player.classList.remove('hidden');
-    video.play();
+    if (video) video.play();
   } else {
-    video.pause();
-    video.currentTime = 0;
+    if (video) { video.pause(); video.currentTime = 0; }
     player.classList.add('hidden');
   }
 }
