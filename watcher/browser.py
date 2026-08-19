@@ -1,14 +1,22 @@
+import logging
+import os
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import configparser
 import pytz
-from flask import Blueprint, render_template_string, request, jsonify
+from flask import Blueprint, render_template_string, request, jsonify, send_file, abort
 from sqlalchemy import select, desc, func, exists, Text
 from sqlalchemy.orm import joinedload
+from PIL import Image
 
 from .model import EventObservation, Labeling, IntermediateResult, StealthcamFeedback
 from .connection import application_config
 
 __all__ = ['browser_bp']
+
+log = logging.getLogger(__name__)
 
 browser_bp = Blueprint('browser', __name__)
 
@@ -21,6 +29,156 @@ ML_DECIDER_EXACT = 'yolo11n+vlm'
 # pipeline writes sub-image JPEGs (video_file = '<guid>_<n>.JPG'); the
 # dashboard must render those as <img>, not a <video> player.
 PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+
+
+# ── lazy thumbnails ──────────────────────────────────────────────────────────
+#
+# The /browser list renders each card's <img> at 192x108 but was serving the
+# full 1024x576 JPEG (~142KB) and downscaling in-browser. We generate a ~320px
+# wide JPEG thumbnail lazily on first request, cache it on disk under a
+# deterministic name derived from the source path, and serve it with a long
+# Cache-Control (GUID filenames are immutable). The enlarge/click path keeps
+# the full-resolution URL.
+#
+# Thumbnails are regenerable, so purging them is always safe (no data loss).
+
+THUMB_MAX_WIDTH = 320
+THUMB_JPEG_QUALITY = 80
+THUMB_DIR_NAME = 'thumb'
+
+# Throttle state for the purge check (module-level, not a function attribute).
+_last_purge_run = 0.0
+
+
+def _thumb_config():
+    """Read thumbnail knobs from [thumb] in the app config (with defaults).
+
+    The [thumb] section is optional; a missing section or missing key falls
+    back to the default (never raises).
+    """
+    def _get(key, default):
+        try:
+            val = application_config('thumb', key)
+        except (KeyError, configparser.Error):
+            return default
+        try:
+            return int(val) if val else default
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        'max_count': _get('MAX_COUNT', 20000),
+        'max_bytes': _get('MAX_BYTES', 0),
+        'max_age_days': _get('MAX_AGE_DAYS', 0),
+    }
+
+
+def _thumb_dir() -> Path:
+    """Root directory thumbnails are written under (LOCAL_DATA_DIR/thumb)."""
+    return Path(application_config('system', 'LOCAL_DATA_DIR')) / THUMB_DIR_NAME
+
+
+def _thumb_path_for(source_relpath: str) -> Path:
+    """Deterministic on-disk path for a source file's thumbnail.
+
+    The source relpath (e.g. 'stealthcam/<guid>_1.JPG' or
+    'wichitaDriveway/2025/10/02/....jpg') is mirrored under the thumb root so
+    the mapping is idempotent and collision-free across cameras.
+    """
+    rel = Path(source_relpath)
+    # Guard against path traversal: never escape the thumb root.
+    if rel.is_absolute() or '..' in rel.parts:
+        raise ValueError(f"unsafe source relpath: {source_relpath}")
+    return _thumb_dir() / rel.with_suffix('.jpg')
+
+
+def _thumb_url_for(source_relpath: str) -> str:
+    """Public URL for a source file's thumbnail (served by the /thumb route)."""
+    return f"/watcher/thumb/{source_relpath}"
+
+
+def _source_abs_path(source_relpath: str) -> Path:
+    """Absolute path of the source image under LOCAL_DATA_DIR."""
+    return Path(application_config('system', 'LOCAL_DATA_DIR')) / source_relpath
+
+
+def _generate_thumbnail(source_abs: Path, dest: Path) -> None:
+    """Downscale source_abs to a ~320px JPEG at dest (atomic write)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix('.tmp')
+    try:
+        with Image.open(source_abs) as img:
+            img = img.convert('RGB')
+            if img.width > THUMB_MAX_WIDTH:
+                height = round(img.height * (THUMB_MAX_WIDTH / img.width))
+                img = img.resize((THUMB_MAX_WIDTH, height), Image.Resampling.LANCZOS)
+            img.save(tmp, 'JPEG', quality=THUMB_JPEG_QUALITY, optimize=True)
+        os.replace(tmp, dest)
+    except Exception:
+        # Never leave a partial thumbnail behind. unlink(missing_ok=True) only
+        # raises on a real I/O error (e.g. permission), which we log and let
+        # the original exception propagate.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError as cleanup_err:
+            log.warning("failed to clean up partial thumbnail %s: %s", tmp, cleanup_err)
+        raise
+
+
+def _purge_thumbnails_if_needed() -> None:
+    """Best-effort thumbnail cleanup, bounded to run at most once per minute.
+
+    Enforces the [thumb] knobs (max count / max bytes / max age). Thumbnails
+    are regenerable so deletion is always safe. Failures are logged and
+    swallowed — a purge error must never break thumbnail serving.
+    """
+    global _last_purge_run
+
+    cfg = _thumb_config()
+    if not (cfg['max_count'] or cfg['max_bytes'] or cfg['max_age_days']):
+        return
+
+    # Throttle: at most one purge per minute across the process.
+    now = time.time()
+    if now - _last_purge_run < 60:
+        return
+    _last_purge_run = now
+
+    root = _thumb_dir()
+    if not root.is_dir():
+        return
+    try:
+        files = [p for p in root.rglob('*.jpg') if p.is_file()]
+        removed = 0
+
+        if cfg['max_age_days']:
+            cutoff = now - cfg['max_age_days'] * 86400
+            for p in files:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+                    removed += 1
+            files = [p for p in files if p.exists()]
+
+        if cfg['max_bytes']:
+            files.sort(key=lambda p: p.stat().st_mtime)
+            total = sum(p.stat().st_size for p in files)
+            while total > cfg['max_bytes'] and files:
+                p = files.pop(0)
+                total -= p.stat().st_size
+                p.unlink(missing_ok=True)
+                removed += 1
+
+        if cfg['max_count']:
+            files.sort(key=lambda p: p.stat().st_mtime)
+            while len(files) > cfg['max_count']:
+                p = files.pop(0)
+                p.unlink(missing_ok=True)
+                removed += 1
+
+        if removed:
+            log.info("thumbnail purge removed %d files", removed)
+    except Exception as e:
+        log.warning("thumbnail purge failed: %s", e)
 
 
 def _is_photo(event) -> bool:
@@ -140,11 +298,32 @@ def _serialize(event):
         'lighting':     event.lighting_type or '',
         'video_url':    event.video_url,
         'frame_url':    event.significant_frame_url,
+        'thumb_url':    _thumb_url(event),
         'is_photo':     _is_photo(event),
         'ml':           _ml_info(event),
         'human':        _human_info(event),
         'feedback':     _feedback_info(event),
     }
+
+
+def _thumb_url(event):
+    """Thumbnail URL for an event's significant frame, or None if no frame.
+
+    Derived from the frame's on-disk relpath (the IntermediateResult.file),
+    which is stable and deterministic. Returns None when the event has no
+    significant frame or the relpath is malformed (the card then renders its
+    'no frame' placeholder).
+    """
+    if not event.results:
+        return None
+    relpath = event.results[-1].file
+    if not relpath:
+        return None
+    rel = Path(relpath)
+    if rel.is_absolute() or '..' in rel.parts:
+        log.warning("skipping thumbnail for unsafe relpath: %s", relpath)
+        return None
+    return _thumb_url_for(relpath)
 
 
 def _recent_cutoff():
@@ -305,6 +484,42 @@ def events_json():
 
     events, has_more = _fetch(db.session, page, filter_mode, camera, description)
     return jsonify({'events': events, 'has_more': has_more, 'page': page})
+
+
+# ── thumbnail route ──────────────────────────────────────────────────────────
+
+@browser_bp.route('/thumb/<path:relpath>')
+def thumbnail(relpath):
+    """Serve a lazily-generated thumbnail for a source image.
+
+    The relpath is the source file's path under LOCAL_DATA_DIR (e.g.
+    'stealthcam/<guid>_1.JPG'). On first request the thumbnail is generated
+    (downscaled to ~320px JPEG) and cached on disk; subsequent requests are
+    served from disk with a long Cache-Control (source filenames are
+    immutable). Missing source -> 404; unreadable source -> 404 (never a 500
+    that would break the card's onerror fallback).
+    """
+    try:
+        source_abs = _source_abs_path(relpath)
+        dest = _thumb_path_for(relpath)
+    except ValueError:
+        abort(404)
+
+    if not source_abs.is_file():
+        abort(404)
+
+    if not dest.is_file():
+        try:
+            _generate_thumbnail(source_abs, dest)
+        except Exception as e:
+            log.warning("thumbnail generation failed for %s: %s", relpath, e)
+            abort(404)
+
+    _purge_thumbnails_if_needed()
+
+    resp = send_file(dest, mimetype='image/jpeg', conditional=True)
+    resp.headers['Cache-Control'] = 'public, max-age=2592000, immutable'
+    return resp
 
 
 # ── feedback route ───────────────────────────────────────────────────────────
@@ -506,8 +721,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
 
     <div class="flex">
       <div class="card-thumb flex-shrink-0 cursor-pointer" onclick="toggleMedia(this.closest('.event-card'))">
-        {% if ev.frame_url %}
-        <img src="{{ ev.frame_url }}" alt="frame" loading="lazy"
+        {% if ev.thumb_url %}
+        <img src="{{ ev.thumb_url }}" alt="frame" loading="lazy"
              onerror="this.closest('.card-thumb').innerHTML='<div class=\'flex items-center justify-center h-full text-slate-400 text-xs p-2\'>no frame</div>'">
         {% else %}
         <div class="flex items-center justify-center h-full text-slate-400 text-xs p-2">{% if ev.is_photo %}🖼 photo{% else %}▶ video{% endif %}</div>
@@ -634,8 +849,8 @@ function renderCard(ev) {
   const isPhoto = !!ev.is_photo;
   const border = ml ? (ml.interesting ? 'border-l-green-400' : 'border-l-slate-300') : 'border-l-amber-300';
   const lighting = ev.lighting ? ` · ${LIGHTING_LABEL[ev.lighting] || ''} ${ev.lighting}` : '';
-  const thumb = ev.frame_url
-    ? `<img src="${ev.frame_url}" loading="lazy" style="width:192px;height:108px;object-fit:cover;display:block" onerror="this.closest('.card-thumb').innerHTML='<div style=padding:8px;color:#9ca3af;font-size:12px>no frame</div>'">`
+  const thumb = ev.thumb_url
+    ? `<img src="${ev.thumb_url}" loading="lazy" style="width:192px;height:108px;object-fit:cover;display:block" onerror="this.closest('.card-thumb').innerHTML='<div style=padding:8px;color:#9ca3af;font-size:12px>no frame</div>'">`
     : `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#9ca3af;font-size:12px;padding:8px">${isPhoto ? '🖼 photo' : '▶ video'}</div>`;
   const desc = (ml && ml.description)
     ? `<div style="font-size:11px;color:#64748b;margin-top:4px;font-style:italic">${ml.description}</div>` : '';

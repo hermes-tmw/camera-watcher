@@ -18,3 +18,25 @@ docker compose up
 
 [Note: not maintained] The first task of this project is to collect training labels of the video clips. An [iPhone app](https://github.com/tomwhipple/camera-trainer) was developed which uses this framework to store results.
 
+## Dashboard thumbnails
+
+The `/browser` list serves lazily-generated thumbnails (downscaled to ~320px
+JPEG) instead of the full-resolution frames, and nginx serves static images
+with `Cache-Control: public, immutable` (GUID filenames are immutable).
+
+Thumbnails are generated on first request and cached under
+`LOCAL_DATA_DIR/thumb/`, keyed deterministically from the source path. They
+are regenerable, so purging them is always safe (no data loss).
+
+Optional `[thumb]` knobs in the app config (`watcher.cfg` / `application.cfg`):
+
+| Key           | Meaning                                              | Default |
+|---------------|------------------------------------------------------|---------|
+| `MAX_COUNT`   | Max cached thumbnails (oldest deleted first)         | 20000   |
+| `MAX_BYTES`   | Max total bytes of cached thumbnails (0 = unlimited) | 0       |
+| `MAX_AGE_DAYS`| Delete thumbnails older than N days (0 = never)      | 0       |
+
+The purge check runs lazily inside the thumbnail route, throttled to once per
+minute. Unset/0 disables that limit.
+
+
