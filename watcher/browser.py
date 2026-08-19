@@ -611,6 +611,10 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <script>
 const CATEGORY_ICON = {{ CATEGORY_ICON | tojson }};
 const LIGHTING_LABEL = {{ LIGHTING_LABEL | tojson }};
+// The app is served under the /watcher prefix (nginx rewrites /watcher/* -> /*
+// to the api upstream). All fetch() calls must carry the prefix or they hit
+// nginx's static `location /` and 404.
+const API_BASE = '/watcher';
 
 function badge(ml) {
   if (!ml) return '<span data-badge class="flex-shrink-0 px-2 py-1 rounded-full text-xs bg-amber-100 text-amber-700">unclassified</span>';
@@ -720,7 +724,7 @@ async function toggleFeedback(btn, label) {
   }
 
   try {
-    const resp = await fetch('/feedback', {
+    const resp = await fetch(API_BASE + '/feedback', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({event_id: eventId, label: label, reason: reason}),
@@ -784,7 +788,7 @@ function getUnclassifiedIds() {
 async function poll() {
   try {
     // 1. Fetch any events newer than what we have
-    const newResp = await fetch(`/events?filter=${activeFilter}&camera=${encodeURIComponent(activeCamera)}&description=${encodeURIComponent(activeDescription)}&since_id=${maxId}`);
+    const newResp = await fetch(`${API_BASE}/events?filter=${activeFilter}&camera=${encodeURIComponent(activeCamera)}&description=${encodeURIComponent(activeDescription)}&since_id=${maxId}`);
     const newData = await newResp.json();
     if (newData.events.length) {
       const list = document.getElementById('event-list');
@@ -798,7 +802,7 @@ async function poll() {
     const pendingIds = getUnclassifiedIds();
     if (pendingIds.length) {
       const qs = pendingIds.map(id => `id=${id}`).join('&');
-      const updResp = await fetch(`/events?${qs}`);
+      const updResp = await fetch(`${API_BASE}/events?${qs}`);
       const updData = await updResp.json();
       updData.events.forEach(ev => {
         if (!ev.ml) return; // still unclassified
@@ -837,7 +841,7 @@ async function loadMore() {
   const label = document.getElementById('scroll-sentinel-label');
   if (label) label.textContent = 'Loading…';
   try {
-    const resp = await fetch(`/events?page=${page}&filter=${filter}&camera=${encodeURIComponent(camera)}&description=${encodeURIComponent(description)}`);
+    const resp = await fetch(`${API_BASE}/events?page=${page}&filter=${filter}&camera=${encodeURIComponent(camera)}&description=${encodeURIComponent(description)}`);
     const data = await resp.json();
     const list = document.getElementById('event-list');
     data.events.forEach(ev => {

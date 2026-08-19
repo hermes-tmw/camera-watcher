@@ -62,6 +62,14 @@ class TestBrowserInfiniteScroll(unittest.TestCase):
         self.assertIn('data-page="2"', html)
         self.assertIn('IntersectionObserver', html)
         self.assertNotIn('load-more-btn', html)
+        # The app is served under /watcher (nginx rewrites /watcher/* -> /*).
+        # Every fetch() must carry the prefix or it 404s against nginx's
+        # static `location /`. Pin the API_BASE constant and that no bare
+        # absolute-path fetch survives.
+        self.assertIn("const API_BASE = '/watcher'", html)
+        self.assertNotIn("fetch('/events", html)
+        self.assertNotIn("fetch(`/events", html)
+        self.assertNotIn("fetch('/feedback", html)
 
     def test_events_returns_next_page(self):
         self._clear_events()
