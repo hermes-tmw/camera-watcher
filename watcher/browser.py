@@ -350,6 +350,39 @@ def _recent_cutoff():
     return datetime.now(timezone.utc) - timedelta(days=RECENT_DAYS)
 
 
+def _parse_date_bound(value, is_start):
+    """Parse a YYYY-MM-DD (or full ISO) date into a naive UTC datetime bound.
+
+    The user picks a date in the camera's timezone (US/Mountain), but
+    ``capture_time`` is stored as a naive ``timestamp without time zone``
+    holding UTC wall-clock time (the model stores an aware Mountain datetime
+    and psycopg2 converts it to UTC on insert; ``_recent_cutoff`` and
+    ``_fmt_time`` both treat the column as UTC). So the bound is localized to
+    the camera timezone, snapped to start/end of day, then converted to
+    UTC-naive for a naive-to-naive comparison. ``is_start`` yields 00:00:00,
+    else 23:59:59.999999. Returns None for empty/invalid input (no filter).
+    """
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = _tz().localize(dt)
+    else:
+        dt = dt.astimezone(_tz())
+    if is_start:
+        dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    # Convert the camera-timezone bound to UTC-naive to match the column.
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _base_stmt():
     return (select(EventObservation)
             .options(joinedload(EventObservation.labelings),
@@ -362,7 +395,8 @@ def _has_frame_subq():
     return select(IntermediateResult.event_id).correlate(EventObservation)
 
 
-def _fetch(db_session, page, filter_mode, camera=None, description=None):
+def _fetch(db_session, page, filter_mode, camera=None, description=None,
+           start=None, end=None):
     stmt = _base_stmt()
 
     if camera:
@@ -371,8 +405,19 @@ def _fetch(db_session, page, filter_mode, camera=None, description=None):
     if description:
         stmt = stmt.where(EventObservation.id.in_(_description_subq(description)))
 
+    # Date range (inclusive) — composes with every filter mode below.
+    if start:
+        stmt = stmt.where(EventObservation.capture_time >= start)
+    if end:
+        stmt = stmt.where(EventObservation.capture_time <= end)
+
+    # An explicit start date overrides the implicit 60-day "recent" window;
+    # otherwise the recent cutoff remains the default lower bound.
+    recent_cutoff = None if start else _recent_cutoff()
+
     if filter_mode == 'recent':
-        stmt = stmt.where(EventObservation.capture_time >= _recent_cutoff())
+        if recent_cutoff is not None:
+            stmt = stmt.where(EventObservation.capture_time >= recent_cutoff)
 
     elif filter_mode == 'interesting':
         ids = (select(Labeling.event_id)
@@ -391,12 +436,14 @@ def _fetch(db_session, page, filter_mode, camera=None, description=None):
         has_frame  = select(IntermediateResult.event_id)
         stmt = (stmt
                 .where(EventObservation.id.notin_(classified))
-                .where(EventObservation.id.in_(has_frame))
-                .where(EventObservation.capture_time >= _recent_cutoff()))
+                .where(EventObservation.id.in_(has_frame)))
+        if recent_cutoff is not None:
+            stmt = stmt.where(EventObservation.capture_time >= recent_cutoff)
 
     # 'all' — no filter, but cap at recent to avoid drowning in old frameless events
     else:
-        stmt = stmt.where(EventObservation.capture_time >= _recent_cutoff())
+        if recent_cutoff is not None:
+            stmt = stmt.where(EventObservation.capture_time >= recent_cutoff)
 
     offset = (page - 1) * PAGE_SIZE
     rows = db_session.execute(stmt.offset(offset).limit(PAGE_SIZE + 1)).scalars().unique().all()
@@ -452,8 +499,11 @@ def browser_page():
     page = request.args.get('page', 1, type=int)
     camera = request.args.get('camera') or None
     description = (request.args.get('description') or '').strip() or None
+    start = _parse_date_bound(request.args.get('start'), is_start=True)
+    end = _parse_date_bound(request.args.get('end'), is_start=False)
 
-    events, has_more = _fetch(db.session, page, filter_mode, camera, description)
+    events, has_more = _fetch(db.session, page, filter_mode, camera, description,
+                              start, end)
     counts = _counts(db.session)
     cameras = _cameras(db.session)
     telemetry = _latest_telemetry(db.session)
@@ -469,6 +519,8 @@ def browser_page():
         camera=camera,
         telemetry=telemetry,
         description=description or '',
+        start=request.args.get('start') or '',
+        end=request.args.get('end') or '',
         CATEGORY_ICON=CATEGORY_ICON,
         LIGHTING_LABEL=LIGHTING_LABEL,
     )
@@ -484,6 +536,8 @@ def events_json():
     description = (request.args.get('description') or '').strip() or None
     since_id    = request.args.get('since_id', type=int)   # newer events only
     ids         = request.args.getlist('id', type=int)      # re-fetch specific events
+    start       = _parse_date_bound(request.args.get('start'), is_start=True)
+    end         = _parse_date_bound(request.args.get('end'), is_start=False)
 
     if ids:
         # Re-fetch specific events by id (for badge refresh)
@@ -495,8 +549,13 @@ def events_json():
     if since_id is not None:
         # New events only — ignore pagination, just return what arrived since last poll
         stmt = (_base_stmt()
-                .where(EventObservation.capture_time >= _recent_cutoff())
                 .where(EventObservation.id > since_id))
+        if start:
+            stmt = stmt.where(EventObservation.capture_time >= start)
+        else:
+            stmt = stmt.where(EventObservation.capture_time >= _recent_cutoff())
+        if end:
+            stmt = stmt.where(EventObservation.capture_time <= end)
         if camera:
             stmt = stmt.where(EventObservation.camera == camera)
         if description:
@@ -504,7 +563,8 @@ def events_json():
         rows = db.session.execute(stmt).scalars().unique().all()
         return jsonify({'events': [_serialize(e) for e in rows]})
 
-    events, has_more = _fetch(db.session, page, filter_mode, camera, description)
+    events, has_more = _fetch(db.session, page, filter_mode, camera, description,
+                              start, end)
     return jsonify({'events': events, 'has_more': has_more, 'page': page})
 
 
@@ -708,7 +768,9 @@ _TEMPLATE = r"""<!DOCTYPE html>
           class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"
           data-filter="{{ filter }}"
           data-description="{{ description }}"
-          onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.value)+'&description='+encodeURIComponent(this.dataset.description)">
+          data-start="{{ start }}"
+          data-end="{{ end }}"
+          onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.value)+'&description='+encodeURIComponent(this.dataset.description)+'&start='+encodeURIComponent(this.dataset.start)+'&end='+encodeURIComponent(this.dataset.end)">
     <option value="">All cameras</option>
     {% for c in cameras %}
     <option value="{{ c }}" {% if camera == c %}selected{% endif %}>{{ c }}</option>
@@ -717,8 +779,22 @@ _TEMPLATE = r"""<!DOCTYPE html>
   {% endif %}
   <input id="description-input" type="text" value="{{ description }}" placeholder="Filter by description…"
          class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none w-48"
-         data-filter="{{ filter }}" data-camera="{{ camera or '' }}"
-         onkeydown="if(event.key==='Enter'){location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.value)}">
+         data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-start="{{ start }}" data-end="{{ end }}"
+         onkeydown="if(event.key==='Enter'){location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.value)+'&start='+encodeURIComponent(this.dataset.start)+'&end='+encodeURIComponent(this.dataset.end)}">
+  <label class="text-slate-400 text-xs flex items-center gap-1">
+    <span>From</span>
+    <input id="start-input" type="date" value="{{ start }}"
+           class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"
+           data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}" data-end="{{ end }}"
+           onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.dataset.description)+'&start='+encodeURIComponent(this.value)+'&end='+encodeURIComponent(this.dataset.end)">
+  </label>
+  <label class="text-slate-400 text-xs flex items-center gap-1">
+    <span>To</span>
+    <input id="end-input" type="date" value="{{ end }}"
+           class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"
+           data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}" data-start="{{ start }}"
+           onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.dataset.description)+'&start='+encodeURIComponent(this.dataset.start)+'&end='+encodeURIComponent(this.value)">
+  </label>
   <nav class="flex gap-1 ml-auto flex-wrap">
     {% set tabs = [
         ('recent',       'Recent',       counts.recent),
@@ -727,7 +803,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
         ('unclassified', 'Needs Review', counts.unclassified),
     ] %}
     {% for f, label, count in tabs %}
-    <a href="?filter={{ f }}{% if camera %}&camera={{ camera }}{% endif %}{% if description %}&description={{ description }}{% endif %}"
+    <a href="?filter={{ f }}{% if camera %}&camera={{ camera }}{% endif %}{% if description %}&description={{ description }}{% endif %}{% if start %}&start={{ start }}{% endif %}{% if end %}&end={{ end }}{% endif %}"
        class="px-3 py-1 rounded-full text-sm transition-colors flex items-center gap-1
               {% if filter == f %}bg-white text-slate-900 font-medium
               {% else %}text-slate-300 hover:bg-slate-700{% endif %}">
@@ -849,7 +925,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 
 {% if has_more %}
 <div id="scroll-sentinel" class="py-6 text-center text-slate-400 text-sm"
-     data-page="{{ page + 1 }}" data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}">
+     data-page="{{ page + 1 }}" data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}" data-start="{{ start }}" data-end="{{ end }}">
   <span id="scroll-sentinel-label">Loading…</span>
 </div>
 {% endif %}
@@ -1028,6 +1104,8 @@ const POLL_INTERVAL = 30_000; // ms
 const activeFilter = new URLSearchParams(location.search).get('filter') || 'recent';
 const activeCamera = new URLSearchParams(location.search).get('camera') || '';
 const activeDescription = new URLSearchParams(location.search).get('description') || '';
+const activeStart = new URLSearchParams(location.search).get('start') || '';
+const activeEnd = new URLSearchParams(location.search).get('end') || '';
 
 // Seed maxId from server-rendered cards
 let maxId = 0;
@@ -1043,7 +1121,7 @@ function getUnclassifiedIds() {
 async function poll() {
   try {
     // 1. Fetch any events newer than what we have
-    const newResp = await fetch(`${API_BASE}/events?filter=${activeFilter}&camera=${encodeURIComponent(activeCamera)}&description=${encodeURIComponent(activeDescription)}&since_id=${maxId}`);
+    const newResp = await fetch(`${API_BASE}/events?filter=${activeFilter}&camera=${encodeURIComponent(activeCamera)}&description=${encodeURIComponent(activeDescription)}&start=${encodeURIComponent(activeStart)}&end=${encodeURIComponent(activeEnd)}&since_id=${maxId}`);
     const newData = await newResp.json();
     if (newData.events.length) {
       const list = document.getElementById('event-list');
@@ -1109,10 +1187,12 @@ async function loadMore() {
   const filter = sentinel.dataset.filter;
   const camera = sentinel.dataset.camera || '';
   const description = sentinel.dataset.description || '';
+  const start = sentinel.dataset.start || '';
+  const end = sentinel.dataset.end || '';
   const label = document.getElementById('scroll-sentinel-label');
   if (label) label.textContent = 'Loading…';
   try {
-    const resp = await fetch(`${API_BASE}/events?page=${page}&filter=${filter}&camera=${encodeURIComponent(camera)}&description=${encodeURIComponent(description)}`);
+    const resp = await fetch(`${API_BASE}/events?page=${page}&filter=${filter}&camera=${encodeURIComponent(camera)}&description=${encodeURIComponent(description)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
     const data = await resp.json();
     const list = document.getElementById('event-list');
     data.events.forEach(ev => {
