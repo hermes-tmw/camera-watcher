@@ -11,7 +11,7 @@ from sqlalchemy import select, desc, func, exists, Text
 from sqlalchemy.orm import joinedload
 from PIL import Image
 
-from .model import EventObservation, Labeling, IntermediateResult, StealthcamFeedback
+from .model import EventObservation, Labeling, IntermediateResult, StealthcamFeedback, StealthcamTelemetry
 from .connection import application_config
 
 __all__ = ['browser_bp']
@@ -288,6 +288,26 @@ def _feedback_info(event):
     return {'label': fb.label, 'reason': fb.reason or ''}
 
 
+def _latest_telemetry(db_session):
+    """Most recent stealthcam device-status snapshot, or None.
+
+    Feeds the header health readout (battery / disk / signal). Returns a
+    plain dict so the template can render it without touching the ORM.
+    """
+    row = (db_session.execute(
+        select(StealthcamTelemetry).order_by(desc(StealthcamTelemetry.captured_at)).limit(1)
+    ).scalars().first())
+    if row is None:
+        return None
+    return {
+        'battery_pct': row.battery_pct,
+        'sd_card_free_pct': row.sd_card_free_pct,
+        'signal_strength': row.signal_strength,
+        'last_sync_at': _fmt_time(row.last_sync_at) if row.last_sync_at else None,
+        'errors': row.errors or [],
+    }
+
+
 def _serialize(event):
     return {
         'id':           event.id,
@@ -436,6 +456,7 @@ def browser_page():
     events, has_more = _fetch(db.session, page, filter_mode, camera, description)
     counts = _counts(db.session)
     cameras = _cameras(db.session)
+    telemetry = _latest_telemetry(db.session)
 
     return render_template_string(
         _TEMPLATE,
@@ -446,6 +467,7 @@ def browser_page():
         counts=counts,
         cameras=cameras,
         camera=camera,
+        telemetry=telemetry,
         description=description or '',
         CATEGORY_ICON=CATEGORY_ICON,
         LIGHTING_LABEL=LIGHTING_LABEL,
@@ -673,6 +695,14 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <header class="bg-slate-900 text-white px-5 py-3 flex flex-wrap items-center gap-3 sticky top-0 z-10 shadow">
   <span class="text-lg font-semibold tracking-tight">📷 Camera Events</span>
   <a href="/watcher/compare" class="text-slate-400 hover:text-white text-sm ml-2">Compare ↗</a>
+  {% if telemetry %}
+  <span class="text-xs text-slate-300 flex items-center gap-2 ml-1" title="Stealthcam health (latest poll)">
+    <span>🔋 {{ telemetry.battery_pct if telemetry.battery_pct is not none else '—' }}%</span>
+    <span>💾 {{ telemetry.sd_card_free_pct if telemetry.sd_card_free_pct is not none else '—' }}% free</span>
+    <span>📶 {{ telemetry.signal_strength or '—' }}</span>
+    {% if telemetry.errors %}<span class="text-amber-400" title="{{ telemetry.errors | join(', ') }}">⚠ {{ telemetry.errors | length }}</span>{% endif %}
+  </span>
+  {% endif %}
   {% if cameras %}
   <select id="camera-select"
           class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"

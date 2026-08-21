@@ -57,6 +57,11 @@ class StealthcamClient:
         self.app_base = self.s["app_base"].rstrip("/")
         self.cdn_base = self.s["cdn_base"].rstrip("/")
         self.device_id = self.s["device_id"]
+        # The iot/status/on-demand endpoints key on the physical device
+        # identifier (e.g. "402_867490078575292"), NOT the numeric device_id.
+        self.physical_device_identifier = self.s.get(
+            "physical_device_identifier", str(self.device_id)
+        )
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "stealthcam-pipeline/0.1"})
         self.access_token: str | None = None
@@ -120,6 +125,68 @@ class StealthcamClient:
         if r.status_code != 200:
             raise StealthcamError(f"images-list failed: HTTP {r.status_code}")
         return r.json().get("images", [])
+
+    def get_device_status(self) -> dict:
+        """Return the camera's live telemetry/status record.
+
+        This is the endpoint the webapp's battery/signal/disk icons are fed
+        from (discovered from the frontend bundle's XHR, verified live
+        2026-08-21): `GET /api/v4/device-management/devices/status` with the
+        array-form query param `physicalDeviceIdentifier[]=<pid>`.
+
+        Returns the `cameraStatuses[0]` dict, e.g.:
+          {physicalDeviceIdentifier, sdCardFreeSpace (pct free), batteryLevel
+           (pct), batteryVolt, externalBatteryLevel, externalBatteryVolt,
+           rssi, signalStrength, batteryLevelBar, externalBatteryLevelBar,
+           firmwareVersion, lastSyncDateUnixTime (ms), deviceState
+           {onDemandState, newPhotoCounter, onDemandError}, errors [...],
+           rawErrors, powerLvlVolts [...]}
+
+        Raises StealthcamError if the request fails or no status is returned.
+        """
+        r = self.session.get(
+            f"{self.app_base}/api/v4/device-management/devices/status"
+            f"?physicalDeviceIdentifier[]={self.physical_device_identifier}",
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise StealthcamError(f"device status failed: HTTP {r.status_code}")
+        statuses = r.json().get("cameraStatuses") or []
+        if not statuses:
+            raise StealthcamError("device status: no cameraStatuses returned")
+        return statuses[0]
+
+    def trigger_on_demand(self, media_type: str = "Photo") -> dict:
+        """Request a one-shot on-demand capture (manual health check only).
+
+        Mirrors the webapp's exact call: `POST /api/v1/device-management/iot/
+        <pid>/ondemand` with body `{type: <media_type>}` (the frontend sends
+        `{type, force}`; `force` is optional). Returns the parsed response.
+
+        VERIFIED LIVE 2026-08-21: this works on the Revolver 402. A successful
+        trigger moves the device state OnDemandEnabled -> PhotoRequested ->
+        PhotoUploaded, increments newPhotoCounter, and produces a new image
+        with isOnDemand=True. The 400 `ODStateNotSupported` error is
+        STATE-DEPENDENT, not a hard "unsupported": it is returned when a
+        request is already in flight (the device is no longer in
+        OnDemandEnabled state). Callers should check get_device_status()'s
+        onDemandState and retry once the state returns to OnDemandEnabled.
+
+        On-demand is a manual one-shot only — it must NEVER be used as a
+        substitute for PIR motion detection (a single snapshot cannot catch a
+        passerby between triggers). The error is surfaced as a StealthcamError
+        so callers fail loudly rather than silently assuming a photo was taken.
+        """
+        r = self.session.post(
+            f"{self.app_base}/api/v1/device-management/iot/{self.physical_device_identifier}/ondemand",
+            json={"type": media_type},
+            timeout=30,
+        )
+        if r.status_code not in (200, 204):
+            raise StealthcamError(
+                f"on-demand failed: HTTP {r.status_code} {r.text[:200]}"
+            )
+        return r.json() if r.content else {}
 
     def download_subimage(self, guid: str, n: int, dest: Path) -> Path:
         """Download sub-image `n` (1..6) of a capture to `dest` (a file path)."""

@@ -20,7 +20,7 @@ from .output import get_local_time_iso
 from .connection import application_config, in_docker, application_path_for
 from .outdoors import sunlight_from_time_for_location
 
-__all__ = ['EventObservation', 'EventClassification', 'Computation', 'Labeling', 'IntermediateResult', 'StealthcamFeedback']
+__all__ = ['EventObservation', 'EventClassification', 'Computation', 'Labeling', 'IntermediateResult', 'StealthcamFeedback', 'StealthcamTelemetry']
 
 config = application_config()
 class WatcherBase(DeclarativeBase):
@@ -431,3 +431,34 @@ class StealthcamFeedback(WatcherBase):
         super().__init__(**input)
         if not self.created_at:
             self.created_at = datetime.now()
+
+
+class StealthcamTelemetry(WatcherBase):
+    """One device-status snapshot from the stealthcam pipeline (append-only).
+
+    The pipeline writes a row each poll (battery %, disk free %, signal,
+    sync time, errors) so the dashboard can surface camera health. The
+    dashboard reads the latest row; the history enables trend queries.
+    """
+    __tablename__ = 'stealthcam_telemetry'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    device_id: Mapped[Optional[str]] = mapped_column()
+    captured_at: Mapped[datetime] = mapped_column()
+    battery_pct: Mapped[Optional[int]] = mapped_column()
+    battery_volt: Mapped[Optional[float]] = mapped_column()
+    external_battery_pct: Mapped[Optional[int]] = mapped_column()
+    external_battery_volt: Mapped[Optional[float]] = mapped_column()
+    sd_card_free_pct: Mapped[Optional[int]] = mapped_column()
+    rssi: Mapped[Optional[int]] = mapped_column()
+    signal_strength: Mapped[Optional[str]] = mapped_column()
+    firmware_version: Mapped[Optional[str]] = mapped_column()
+    last_sync_at: Mapped[Optional[datetime]] = mapped_column()
+    on_demand_state: Mapped[Optional[str]] = mapped_column()
+    errors: Mapped[Optional[list]] = mapped_column(JSON)
+    raw: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    def __init__(self, **input):
+        super().__init__(**input)
+        if not self.captured_at:
+            self.captured_at = datetime.now()
