@@ -717,10 +717,11 @@ _TEMPLATE = r"""<!DOCTYPE html>
   {% else %}{% set border = 'border-l-amber-300' %}{% endif %}
 
   <div class="event-card bg-white rounded-xl shadow-sm flex flex-col overflow-hidden border border-slate-200 border-l-4 {{ border }}"
-       data-id="{{ ev.id }}" data-classified="{{ '1' if ml else '0' }}" data-video="{{ ev.video_url }}">
+       data-id="{{ ev.id }}" data-classified="{{ '1' if ml else '0' }}" data-video="{{ ev.video_url }}"
+       onclick="cardClick(event)">
 
     <div class="flex">
-      <div class="card-thumb flex-shrink-0 cursor-pointer" onclick="toggleMedia(this.closest('.event-card'))">
+      <div class="card-thumb flex-shrink-0 cursor-pointer">
         {% if ev.thumb_url %}
         <img src="{{ ev.thumb_url }}" alt="frame" loading="lazy"
              onerror="this.closest('.card-thumb').innerHTML='<div class=\'flex items-center justify-center h-full text-slate-400 text-xs p-2\'>no frame</div>'">
@@ -783,12 +784,12 @@ _TEMPLATE = r"""<!DOCTYPE html>
         </div>
 
         {% if ev.is_photo %}
-        <button onclick="toggleMedia(this.closest('.event-card'))"
+        <button
                 class="mt-auto pt-2 text-xs text-blue-500 hover:text-blue-700 hover:underline w-fit text-left">
           🔍 Enlarge
         </button>
         {% else %}
-        <button onclick="toggleMedia(this.closest('.event-card'))"
+        <button
                 class="mt-auto pt-2 text-xs text-blue-500 hover:text-blue-700 hover:underline w-fit text-left">
           ▶ Watch clip
         </button>
@@ -871,8 +872,8 @@ function renderCard(ev) {
       ${fbReason}
     </div>`;
   const watchBtn = isPhoto
-    ? `<button onclick="toggleMedia(this.closest('.event-card'))" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">🔍 Enlarge</button>`
-    : `<button onclick="toggleMedia(this.closest('.event-card'))" class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">▶ Watch clip</button>`;
+    ? `<button class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">🔍 Enlarge</button>`
+    : `<button class="mt-auto pt-2 text-xs text-blue-500 hover:underline w-fit text-left">▶ Watch clip</button>`;
   const player = isPhoto
     ? `<div class="photo-player hidden">
         <img src="${ev.frame_url}" alt="enlarged frame" loading="lazy" style="width:100%;display:block;max-height:600px;object-fit:contain;background:#000">
@@ -884,9 +885,9 @@ function renderCard(ev) {
       </div>`;
   return `
     <div class="event-card bg-white rounded-xl shadow-sm flex flex-col overflow-hidden border border-slate-200 border-l-4 ${border}"
-         data-id="${ev.id}" data-classified="${ml ? 1 : 0}" data-video="${ev.video_url}">
+         data-id="${ev.id}" data-classified="${ml ? 1 : 0}" data-video="${ev.video_url}" onclick="cardClick(event)">
       <div class="flex">
-        <div class="card-thumb flex-shrink-0 cursor-pointer" onclick="toggleMedia(this.closest('.event-card'))">${thumb}</div>
+        <div class="card-thumb flex-shrink-0 cursor-pointer">${thumb}</div>
         <div class="p-4 flex-1 flex flex-col gap-1 min-w-0">
           <div class="flex items-start justify-between gap-2 flex-wrap">
             <div>
@@ -904,6 +905,15 @@ function renderCard(ev) {
 }
 
 // ── inline media player (photo enlarge / video) ──────────────────────────────
+
+// Whole-cell click toggles enlarge/play. Interactive controls that have their
+// own handlers (feedback buttons, the video player) are excluded so a 👍/👎
+// click or a play/pause tap doesn't also collapse the card.
+function cardClick(event) {
+  if (event.target.closest('[data-feedback-row]')) return;
+  if (event.target.closest('.video-player')) return;
+  toggleMedia(event.currentTarget);
+}
 
 function toggleMedia(card) {
   const photo = card.querySelector('.photo-player');
