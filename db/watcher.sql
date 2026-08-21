@@ -106,3 +106,21 @@ CREATE TABLE stealthcam_feedback (
     PRIMARY KEY (id),
     FOREIGN KEY(event_id) REFERENCES event_observations (id)
 );
+CREATE TABLE stealthcam_telemetry (
+    id INTEGER NOT NULL,
+    device_id VARCHAR,
+    captured_at DATETIME NOT NULL,
+    battery_pct INTEGER,
+    battery_volt FLOAT,
+    external_battery_pct INTEGER,
+    external_battery_volt FLOAT,
+    sd_card_free_pct INTEGER,
+    rssi INTEGER,
+    signal_strength VARCHAR,
+    firmware_version VARCHAR,
+    last_sync_at DATETIME,
+    on_demand_state VARCHAR,
+    errors JSON,
+    raw JSON,
+    PRIMARY KEY (id)
+);

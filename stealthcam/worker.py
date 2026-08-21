@@ -216,6 +216,22 @@ def run_once(cfg) -> dict:
         new_captures = [im for im in images if not memory.has_seen(im["imageGuid"])]
         log.info("poll: %d images, %d new", len(images), len(new_captures))
 
+        # Capture device telemetry (battery/disk/signal) each poll. This is
+        # independent of image processing: it records camera health even when
+        # there are no new images (the "no recent images" gap is a camera
+        # power/PIR question, not a pipeline bug — telemetry is how we see it).
+        if dashboard is not None:
+            try:
+                status = client.get_device_status()
+                dashboard.write_telemetry(status)
+                log.info(
+                    "telemetry: battery=%s%% sd_free=%s%% signal=%s errors=%s",
+                    status.get("batteryLevel"), status.get("sdCardFreeSpace"),
+                    status.get("signalStrength"), status.get("errors"),
+                )
+            except Exception as e:
+                log.error("telemetry capture failed: %s", e)
+
         total = {"alerts": 0, "flags": 0, "suppressed": 0, "detections": 0, "captures": 0}
         for capture in new_captures:
             s = process_capture(capture, client, detector, describer, memory,

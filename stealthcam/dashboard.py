@@ -110,5 +110,60 @@ class DashboardWriter:
             self._conn.rollback()
             raise
 
+    def write_telemetry(self, status: dict) -> int:
+        """Persist one device-status snapshot into `stealthcam_telemetry`.
+
+        `status` is the `cameraStatuses[0]` dict from the client's
+        `get_device_status()`. We store the fields the dashboard's health
+        readout needs (battery, disk, signal, sync, errors) plus the raw
+        record as JSON for future fields. Returns the new row id.
+
+        The table is append-only (one row per poll) so battery/disk trends
+        are queryable over time; the dashboard reads the latest row.
+        """
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO stealthcam_telemetry "
+                "(device_id, captured_at, battery_pct, battery_volt, "
+                " external_battery_pct, external_battery_volt, "
+                " sd_card_free_pct, rssi, signal_strength, firmware_version, "
+                " last_sync_at, on_demand_state, errors, raw) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id",
+                (
+                    status.get("physicalDeviceIdentifier"),
+                    datetime.now(),
+                    status.get("batteryLevel"),
+                    status.get("batteryVolt"),
+                    status.get("externalBatteryLevel"),
+                    status.get("externalBatteryVolt"),
+                    status.get("sdCardFreeSpace"),
+                    status.get("rssi"),
+                    status.get("signalStrength"),
+                    status.get("firmwareVersion"),
+                    self._sync_time_naive(status.get("lastSyncDateUnixTime")),
+                    (status.get("deviceState") or {}).get("onDemandState"),
+                    json.dumps(status.get("errors") or []),
+                    json.dumps(status),
+                ),
+            )
+            row = cur.fetchone()
+            self._conn.commit()
+            if row is None:
+                raise RuntimeError("write_telemetry: no id returned")
+            return row[0]
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @staticmethod
+    def _sync_time_naive(ms: int | None) -> datetime | None:
+        """Convert a lastSyncDateUnixTime (ms epoch) to a naive US/Mountain time."""
+        if not ms:
+            return None
+        dt = datetime.fromtimestamp(ms / 1000.0, tz=pytz.UTC)
+        return dt.astimezone(pytz.timezone(CAMERA_TZ)).replace(tzinfo=None)
+
     def close(self) -> None:
         self._conn.close()
