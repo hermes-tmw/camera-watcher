@@ -20,7 +20,13 @@ def fetch_video_from_file(video_file):
     video_info = next(stream for stream in info['streams'] if stream['codec_type'] == 'video')
     width = int(video_info['width'])
     height = int (video_info['height'])
-    num_frames = int(video_info['nb_frames'])
+    # Matroska (.mkv) streaming container: ffprobe reports no nb_frames. cv2 fallback.
+    if 'nb_frames' in video_info:
+        num_frames = int(video_info['nb_frames'])
+    else:
+        cap = cv.VideoCapture(video_file)
+        num_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+        cap.release()
 
     out, err = (
         ffmpeg

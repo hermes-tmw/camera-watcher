@@ -97,8 +97,22 @@ class EventVideo(object):
             video_info = next(stream for stream in info['streams'] if stream['codec_type'] == 'video')
             self.width = int(video_info['width'])
             self.height = int (video_info['height'])
-            self.num_frames = int(video_info['nb_frames'])
-            self.duration = float(video_info['duration'])
+            # Matroska (.mkv) is a streaming container: ffprobe reports no nb_frames/duration.
+            # Fall back to OpenCV when they're missing so classification isn't silently skipped.
+            self.num_frames = int(video_info['nb_frames']) if 'nb_frames' in video_info else 0
+            self.duration = float(video_info['duration']) if 'duration' in video_info else 0.0
+            if not self.num_frames or not self.duration:
+                cap = cv.VideoCapture(self.file)
+                if cap.isOpened():
+                    n = cap.get(cv.CAP_PROP_FRAME_COUNT)
+                    fps = cap.get(cv.CAP_PROP_FPS)
+                    if n and n > 0:
+                        self.num_frames = int(n)
+                    if fps and fps > 0 and self.num_frames:
+                        self.duration = self.num_frames / fps
+                cap.release()
+                logger.warning(f"ffprobe lacked nb_frames/duration for {self.file}; "
+                               f"cv2 fallback -> frames={self.num_frames} duration={self.duration}")
 
         except KeyError as ke:
             logger.error(str(ke))
