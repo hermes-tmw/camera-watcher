@@ -383,12 +383,23 @@ def _parse_date_bound(value, is_start):
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-def _base_stmt():
+def _parse_order(value):
+    """Normalize the sort-order param to 'asc' or 'desc' (default desc).
+
+    Any value other than 'asc' falls back to 'desc' so a malformed/absent
+    param can never 500 or silently reorder the default view.
+    """
+    return 'asc' if (value or '').strip().lower() == 'asc' else 'desc'
+
+
+def _base_stmt(order='desc'):
+    order_clause = (EventObservation.capture_time.asc() if order == 'asc'
+                    else desc(EventObservation.capture_time))
     return (select(EventObservation)
             .options(joinedload(EventObservation.labelings),
                      joinedload(EventObservation.results),
                      joinedload(EventObservation.feedback))
-            .order_by(desc(EventObservation.capture_time)))
+            .order_by(order_clause))
 
 
 def _has_frame_subq():
@@ -396,8 +407,8 @@ def _has_frame_subq():
 
 
 def _fetch(db_session, page, filter_mode, camera=None, description=None,
-           start=None, end=None):
-    stmt = _base_stmt()
+           start=None, end=None, order='desc'):
+    stmt = _base_stmt(order=order)
 
     if camera:
         stmt = stmt.where(EventObservation.camera == camera)
@@ -501,9 +512,10 @@ def browser_page():
     description = (request.args.get('description') or '').strip() or None
     start = _parse_date_bound(request.args.get('start'), is_start=True)
     end = _parse_date_bound(request.args.get('end'), is_start=False)
+    order = _parse_order(request.args.get('order'))
 
     events, has_more = _fetch(db.session, page, filter_mode, camera, description,
-                              start, end)
+                              start, end, order)
     counts = _counts(db.session)
     cameras = _cameras(db.session)
     telemetry = _latest_telemetry(db.session)
@@ -521,6 +533,7 @@ def browser_page():
         description=description or '',
         start=request.args.get('start') or '',
         end=request.args.get('end') or '',
+        order=order,
         CATEGORY_ICON=CATEGORY_ICON,
         LIGHTING_LABEL=LIGHTING_LABEL,
     )
@@ -538,17 +551,18 @@ def events_json():
     ids         = request.args.getlist('id', type=int)      # re-fetch specific events
     start       = _parse_date_bound(request.args.get('start'), is_start=True)
     end         = _parse_date_bound(request.args.get('end'), is_start=False)
+    order       = _parse_order(request.args.get('order'))
 
     if ids:
         # Re-fetch specific events by id (for badge refresh)
-        stmt = (_base_stmt()
+        stmt = (_base_stmt(order=order)
                 .where(EventObservation.id.in_(ids)))
         rows = db.session.execute(stmt).scalars().unique().all()
         return jsonify({'events': [_serialize(e) for e in rows]})
 
     if since_id is not None:
         # New events only — ignore pagination, just return what arrived since last poll
-        stmt = (_base_stmt()
+        stmt = (_base_stmt(order=order)
                 .where(EventObservation.id > since_id))
         if start:
             stmt = stmt.where(EventObservation.capture_time >= start)
@@ -564,7 +578,7 @@ def events_json():
         return jsonify({'events': [_serialize(e) for e in rows]})
 
     events, has_more = _fetch(db.session, page, filter_mode, camera, description,
-                              start, end)
+                              start, end, order)
     return jsonify({'events': events, 'has_more': has_more, 'page': page})
 
 
@@ -770,7 +784,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
           data-description="{{ description }}"
           data-start="{{ start }}"
           data-end="{{ end }}"
-          onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.value)+'&description='+encodeURIComponent(this.dataset.description)+'&start='+encodeURIComponent(this.dataset.start)+'&end='+encodeURIComponent(this.dataset.end)">
+          data-order="{{ order }}"
+          onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.value)+'&description='+encodeURIComponent(this.dataset.description)+'&start='+encodeURIComponent(this.dataset.start)+'&end='+encodeURIComponent(this.dataset.end)+'&order='+encodeURIComponent(this.dataset.order)">
     <option value="">All cameras</option>
     {% for c in cameras %}
     <option value="{{ c }}" {% if camera == c %}selected{% endif %}>{{ c }}</option>
@@ -779,22 +794,29 @@ _TEMPLATE = r"""<!DOCTYPE html>
   {% endif %}
   <input id="description-input" type="text" value="{{ description }}" placeholder="Filter by description…"
          class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none w-48"
-         data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-start="{{ start }}" data-end="{{ end }}"
-         onkeydown="if(event.key==='Enter'){location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.value)+'&start='+encodeURIComponent(this.dataset.start)+'&end='+encodeURIComponent(this.dataset.end)}">
+         data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-start="{{ start }}" data-end="{{ end }}" data-order="{{ order }}"
+         onkeydown="if(event.key==='Enter'){location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.value)+'&start='+encodeURIComponent(this.dataset.start)+'&end='+encodeURIComponent(this.dataset.end)+'&order='+encodeURIComponent(this.dataset.order)}">
   <label class="text-slate-400 text-xs flex items-center gap-1">
     <span>From</span>
     <input id="start-input" type="date" value="{{ start }}"
            class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"
-           data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}" data-end="{{ end }}"
-           onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.dataset.description)+'&start='+encodeURIComponent(this.value)+'&end='+encodeURIComponent(this.dataset.end)">
+           data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}" data-end="{{ end }}" data-order="{{ order }}"
+           onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.dataset.description)+'&start='+encodeURIComponent(this.value)+'&end='+encodeURIComponent(this.dataset.end)+'&order='+encodeURIComponent(this.dataset.order)">
   </label>
   <label class="text-slate-400 text-xs flex items-center gap-1">
     <span>To</span>
     <input id="end-input" type="date" value="{{ end }}"
            class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"
-           data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}" data-start="{{ start }}"
-           onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.dataset.description)+'&start='+encodeURIComponent(this.dataset.start)+'&end='+encodeURIComponent(this.value)">
+           data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}" data-start="{{ start }}" data-order="{{ order }}"
+           onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.dataset.description)+'&start='+encodeURIComponent(this.dataset.start)+'&end='+encodeURIComponent(this.value)+'&order='+encodeURIComponent(this.dataset.order)">
   </label>
+  <select id="order-select"
+          class="bg-slate-800 text-slate-200 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none"
+          data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}" data-start="{{ start }}" data-end="{{ end }}"
+          onchange="location.href='?filter='+encodeURIComponent(this.dataset.filter)+'&camera='+encodeURIComponent(this.dataset.camera)+'&description='+encodeURIComponent(this.dataset.description)+'&start='+encodeURIComponent(this.dataset.start)+'&end='+encodeURIComponent(this.dataset.end)+'&order='+encodeURIComponent(this.value)">
+    <option value="desc" {% if order == 'desc' %}selected{% endif %}>Newest first</option>
+    <option value="asc" {% if order == 'asc' %}selected{% endif %}>Oldest first</option>
+  </select>
   <nav class="flex gap-1 ml-auto flex-wrap">
     {% set tabs = [
         ('recent',       'Recent',       counts.recent),
@@ -803,7 +825,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
         ('unclassified', 'Needs Review', counts.unclassified),
     ] %}
     {% for f, label, count in tabs %}
-    <a href="?filter={{ f }}{% if camera %}&camera={{ camera }}{% endif %}{% if description %}&description={{ description }}{% endif %}{% if start %}&start={{ start }}{% endif %}{% if end %}&end={{ end }}{% endif %}"
+    <a href="?filter={{ f }}{% if camera %}&camera={{ camera }}{% endif %}{% if description %}&description={{ description }}{% endif %}{% if start %}&start={{ start }}{% endif %}{% if end %}&end={{ end }}{% endif %}&order={{ order }}"
        class="px-3 py-1 rounded-full text-sm transition-colors flex items-center gap-1
               {% if filter == f %}bg-white text-slate-900 font-medium
               {% else %}text-slate-300 hover:bg-slate-700{% endif %}">
@@ -925,7 +947,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 
 {% if has_more %}
 <div id="scroll-sentinel" class="py-6 text-center text-slate-400 text-sm"
-     data-page="{{ page + 1 }}" data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}" data-start="{{ start }}" data-end="{{ end }}">
+     data-page="{{ page + 1 }}" data-filter="{{ filter }}" data-camera="{{ camera or '' }}" data-description="{{ description }}" data-start="{{ start }}" data-end="{{ end }}" data-order="{{ order }}">
   <span id="scroll-sentinel-label">Loading…</span>
 </div>
 {% endif %}
@@ -1106,6 +1128,7 @@ const activeCamera = new URLSearchParams(location.search).get('camera') || '';
 const activeDescription = new URLSearchParams(location.search).get('description') || '';
 const activeStart = new URLSearchParams(location.search).get('start') || '';
 const activeEnd = new URLSearchParams(location.search).get('end') || '';
+const activeOrder = new URLSearchParams(location.search).get('order') || 'desc';
 
 // Seed maxId from server-rendered cards
 let maxId = 0;
@@ -1121,12 +1144,15 @@ function getUnclassifiedIds() {
 async function poll() {
   try {
     // 1. Fetch any events newer than what we have
-    const newResp = await fetch(`${API_BASE}/events?filter=${activeFilter}&camera=${encodeURIComponent(activeCamera)}&description=${encodeURIComponent(activeDescription)}&start=${encodeURIComponent(activeStart)}&end=${encodeURIComponent(activeEnd)}&since_id=${maxId}`);
+    const newResp = await fetch(`${API_BASE}/events?filter=${activeFilter}&camera=${encodeURIComponent(activeCamera)}&description=${encodeURIComponent(activeDescription)}&start=${encodeURIComponent(activeStart)}&end=${encodeURIComponent(activeEnd)}&order=${encodeURIComponent(activeOrder)}&since_id=${maxId}`);
     const newData = await newResp.json();
     if (newData.events.length) {
       const list = document.getElementById('event-list');
+      // New events are the newest, so they belong at the top in desc order and
+      // at the bottom in asc order.
+      const position = activeOrder === 'asc' ? 'beforeend' : 'afterbegin';
       newData.events.forEach(ev => {
-        list.insertAdjacentHTML('afterbegin', renderCard(ev));
+        list.insertAdjacentHTML(position, renderCard(ev));
         maxId = Math.max(maxId, ev.id);
       });
     }
@@ -1189,10 +1215,11 @@ async function loadMore() {
   const description = sentinel.dataset.description || '';
   const start = sentinel.dataset.start || '';
   const end = sentinel.dataset.end || '';
+  const order = sentinel.dataset.order || 'desc';
   const label = document.getElementById('scroll-sentinel-label');
   if (label) label.textContent = 'Loading…';
   try {
-    const resp = await fetch(`${API_BASE}/events?page=${page}&filter=${filter}&camera=${encodeURIComponent(camera)}&description=${encodeURIComponent(description)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
+    const resp = await fetch(`${API_BASE}/events?page=${page}&filter=${filter}&camera=${encodeURIComponent(camera)}&description=${encodeURIComponent(description)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&order=${encodeURIComponent(order)}`);
     const data = await resp.json();
     const list = document.getElementById('event-list');
     data.events.forEach(ev => {
