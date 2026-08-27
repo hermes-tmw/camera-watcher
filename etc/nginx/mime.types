@@ -39,6 +39,7 @@ types {
   audio/mpeg                            mp3;
   audio/x-realaudio                     ra;
   video/mpeg                            mpeg mpg mp4;
+  video/x-matroska                      mkv;
   video/quicktime                       mov;
   video/x-flv                           flv;
   video/x-msvideo                       avi;
