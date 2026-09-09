@@ -55,11 +55,13 @@ def process_capture(capture: dict, client: StealthcamClient, detector: Detector,
 
     summary = {"guid": guid, "alerts": 0, "flags": 0, "suppressed": 0, "detections": 0}
 
+    downloaded_any = False
     for n in range(1, 7):
         direction = directions[n - 1] if n - 1 < len(directions) else f"dir{n}"
         local = subimage_dir / f"{guid}_{n}.JPG"
         try:
             client.download_subimage(guid, n, local)
+            downloaded_any = True
         except StealthcamError as e:
             log.error("download %s_%d failed: %s", guid, n, e)
             continue
@@ -134,7 +136,16 @@ def process_capture(capture: dict, client: StealthcamClient, detector: Detector,
                 except Exception as e:
                     log.error("notify failed: %s", e)
 
-    memory.mark_seen(guid)
+    if downloaded_any:
+        memory.mark_seen(guid)
+    else:
+        # Every sub-image failed to download (e.g. all 403'd on a stale cookie).
+        # Do NOT mark seen so a later poll (or a cookie refresh) can retry the
+        # capture — otherwise the blind spot is never revisited.
+        log.warning(
+            "capture %s deferred: no sub-images downloaded, will retry next poll",
+            guid,
+        )
     return summary
 
 

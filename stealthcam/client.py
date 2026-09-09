@@ -105,6 +105,16 @@ class StealthcamClient:
         self._cookie_header = f"{name}={val}"
         return self._cookie_header
 
+    def _refresh_cookie(self) -> str:
+        """Invalidate the cached signed cookie and fetch a fresh one.
+
+        The signed CloudFront cookie (`.CloudFront.Cookies`) expires; once it
+        does, every CDN download 403s until the process restarts. Drop the
+        cached header so the next `_ensure_cookie` re-hits cloudfront-token.
+        """
+        self._cookie_header = None
+        return self._ensure_cookie()
+
     # -- data ----------------------------------------------------------------
 
     def list_images(self, take_count: int = 20, cursor: dict | None = None) -> list[dict]:
@@ -189,14 +199,23 @@ class StealthcamClient:
         return r.json() if r.content else {}
 
     def download_subimage(self, guid: str, n: int, dest: Path) -> Path:
-        """Download sub-image `n` (1..6) of a capture to `dest` (a file path)."""
+        """Download sub-image `n` (1..6) of a capture to `dest` (a file path).
+
+        On HTTP 403 (stale signed CloudFront cookie), re-login + re-fetch the
+        cloudfront-token and retry the download once with the fresh cookie.
+        Only raises if the retry also fails.
+        """
         validate_guid(guid)
-        cookie = self._ensure_cookie()
         url = f"{self.cdn_base}/{self.device_id}/{guid}_{n}.JPG"
         # NOTE: use a fresh requests.get, NOT self.session.get — the session's
         # Authorization header + cookie jar cause the CDN to return 401. The
         # signed cookie must be sent as the ONLY auth on a clean request.
+        cookie = self._ensure_cookie()
         r = requests.get(url, headers={"Cookie": cookie}, timeout=60)
+        if r.status_code == 403:
+            # Stale signed cookie — refresh once and retry.
+            cookie = self._refresh_cookie()
+            r = requests.get(url, headers={"Cookie": cookie}, timeout=60)
         if r.status_code != 200 or len(r.content) < 1000:
             raise StealthcamError(
                 f"download {guid}_{n} failed: HTTP {r.status_code}, {len(r.content)} bytes"
