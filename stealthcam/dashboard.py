@@ -41,11 +41,22 @@ class DashboardWriter:
         return f"stealthcam/{guid}_{n}.JPG"
 
     def _capture_time_naive(self, created_dt: str) -> datetime:
-        """Parse the API's createdDateTime and return a naive US/Mountain time."""
+        """Parse the API's createdDateTime and return a naive UTC time.
+
+        The browser's ``_fmt_time`` treats the naive ``capture_time`` column as
+        container-local UTC (matching the motion path), so we store naive UTC.
+        """
         dt = datetime.fromisoformat(created_dt)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=pytz.UTC)
-        return dt.astimezone(pytz.timezone(CAMERA_TZ)).replace(tzinfo=None)
+        return dt.astimezone(pytz.UTC).replace(tzinfo=None)
+
+    def _capture_time_mountain(self, created_dt: str) -> datetime:
+        """Parse createdDateTime into an aware US/Mountain datetime (for lighting)."""
+        dt = datetime.fromisoformat(created_dt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.UTC)
+        return dt.astimezone(pytz.timezone(CAMERA_TZ))
 
     def _lighting(self, dt: datetime) -> str:
         return "daylight" if 7 <= dt.hour < 20 else "night"
@@ -64,7 +75,7 @@ class DashboardWriter:
         video_file = f"{guid}_{subimage}.JPG"
         video_location = "stealthcam"
         capture_time = self._capture_time_naive(created_dt)
-        lighting = self._lighting(capture_time)
+        lighting = self._lighting(self._capture_time_mountain(created_dt))
 
         cur = self._conn.cursor()
         try:
@@ -159,11 +170,16 @@ class DashboardWriter:
 
     @staticmethod
     def _sync_time_naive(ms: int | None) -> datetime | None:
-        """Convert a lastSyncDateUnixTime (ms epoch) to a naive US/Mountain time."""
+        """Convert a lastSyncDateUnixTime (ms epoch) to a naive UTC time.
+
+        ``last_sync_at`` is rendered by the browser's ``_fmt_time``, which
+        treats the naive value as container-local UTC (same convention as
+        ``capture_time``), so we store naive UTC.
+        """
         if not ms:
             return None
         dt = datetime.fromtimestamp(ms / 1000.0, tz=pytz.UTC)
-        return dt.astimezone(pytz.timezone(CAMERA_TZ)).replace(tzinfo=None)
+        return dt.astimezone(pytz.UTC).replace(tzinfo=None)
 
     def close(self) -> None:
         self._conn.close()
