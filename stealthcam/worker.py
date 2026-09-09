@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .client import StealthcamClient, StealthcamError
@@ -41,13 +42,18 @@ def _short_direction(direction: str) -> str:
 def process_capture(capture: dict, client: StealthcamClient, detector: Detector,
                     describer: Describer, memory: Memory, notifier: Notifier,
                     dashboard: DashboardWriter | None, subimage_dir: Path,
-                    baseline_mode: bool = False) -> dict:
+                    baseline_mode: bool = False,
+                    deferred_alert_threshold: int = 3) -> dict:
     """Process one capture (6 sub-images). Returns a summary dict.
 
     In `baseline_mode`, we detect + record memory observations but do NOT
     describe, alert, or write dashboard rows — this seeds the persistence
     baseline (so the parked tractor/car are already "static" before the first
     live alert).
+
+    `deferred_alert_threshold` is the number of consecutive polls a capture
+    must be deferred (all sub-images failed) before a Mattermost alert is
+    posted. The alert fires at most once per guid (tracked in the memory DB).
     """
     guid = capture["imageGuid"]
     directions = capture.get("imageDirections") or [f"dir{i}" for i in range(1, 7)]
@@ -146,6 +152,20 @@ def process_capture(capture: dict, client: StealthcamClient, detector: Detector,
             "capture %s deferred: no sub-images downloaded, will retry next poll",
             guid,
         )
+        # Track the deferral and, once it crosses the threshold, surface a
+        # one-time Mattermost alert so a recurring blind spot is not log-only.
+        count = memory.record_deferral(guid)
+        if (count >= deferred_alert_threshold
+                and not memory.is_deferred_alerted(guid)
+                and notifier is not None):
+            try:
+                notifier.post_alert(
+                    f"stealthcam: capture {guid} deferred {count} consecutive "
+                    f"polls (all sub-images failing) — possible blind spot"
+                )
+                memory.mark_deferred_alerted(guid)
+            except Exception as e:
+                log.error("deferred-alert notify failed: %s", e)
     return summary
 
 
@@ -199,6 +219,64 @@ def backfill(cfg, client: StealthcamClient, detector: Detector, memory: Memory,
     return processed
 
 
+def requeue_deferred(cfg, client: StealthcamClient, detector: Detector,
+                     describer: Describer, memory: Memory, notifier: Notifier,
+                     dashboard: DashboardWriter | None, subimage_dir: Path,
+                     older_than_hours: float = 24.0,
+                     max_captures: int = 200) -> int:
+    """Re-process captures that were never marked seen and are older than the
+    retry window, closing the pre-#31 historical gap permanently.
+
+    A deferred capture ages out of the live retry window once ~20 newer
+    captures exist (`poll_take_count=20` filters by `memory.has_seen`), so a
+    capture that failed before the cookie-refresh fix would never be revisited.
+    This pages `list_images` back in time and re-processes (in NORMAL mode, so
+    real detections/alerts surface) every capture that is still unseen and
+    older than `older_than_hours`. Returns the number of captures re-processed.
+    """
+    log.info("requeue-deferred: paging back for unseen captures older than %.1fh",
+             older_than_hours)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
+
+    captures: list[dict] = []
+    cursor = None
+    while len(captures) < max_captures:
+        images = client.list_images(take_count=50, cursor=cursor)
+        if not images:
+            break
+        captures.extend(images)
+        cursor = {
+            "createdDateTime": images[-1]["createdDateTime"],
+            "uploadedDateTime": images[-1].get("uploadedTime"),
+        }
+        if len(images) < 50:
+            break
+
+    processed = 0
+    for capture in captures:
+        guid = capture["imageGuid"]
+        if memory.has_seen(guid):
+            continue
+        created = capture.get("createdDateTime", "")
+        try:
+            created_dt = datetime.fromisoformat(created)
+        except (ValueError, TypeError):
+            log.warning("requeue-deferred: unparseable createdDateTime %r for %s",
+                        created, guid)
+            continue
+        if created_dt >= cutoff:
+            # Still inside the live retry window — the normal poll will handle it.
+            continue
+        try:
+            process_capture(capture, client, detector, describer, memory,
+                            notifier, dashboard, subimage_dir)
+            processed += 1
+        except Exception as e:
+            log.error("requeue-deferred capture %s failed: %s", guid, e)
+    log.info("requeue-deferred done: %d captures", processed)
+    return processed
+
+
 def run_once(cfg) -> dict:
     client = StealthcamClient(secrets_path=cfg.secrets_stealthcam)
     client.login()
@@ -246,7 +324,8 @@ def run_once(cfg) -> dict:
         total = {"alerts": 0, "flags": 0, "suppressed": 0, "detections": 0, "captures": 0}
         for capture in new_captures:
             s = process_capture(capture, client, detector, describer, memory,
-                                notifier, dashboard, subimage_dir)
+                                notifier, dashboard, subimage_dir,
+                                deferred_alert_threshold=cfg.deferred_alert_threshold)
             total["captures"] += 1
             for k in ("alerts", "flags", "suppressed", "detections"):
                 total[k] += s[k]
@@ -273,6 +352,37 @@ def main() -> None:
         n = backfill(cfg, client, detector, memory, subimage_dir)
         memory.close()
         log.info("backfill complete: %d captures", n)
+        return
+
+    # --requeue-deferred: one-shot re-process of unseen captures older than the
+    # retry window (closes the pre-#31 historical gap). Runs in NORMAL mode so
+    # real detections/alerts surface, then exits.
+    if "--requeue-deferred" in sys.argv:
+        client = StealthcamClient(secrets_path=cfg.secrets_stealthcam)
+        client.login()
+        detector = Detector(cfg.detector_weights, cfg.detector_conf_threshold, cfg.detector_device)
+        describer = Describer(cfg.describer_model, cfg.describer_ollama_host, cfg.describer_timeout)
+        memory = Memory(cfg.pipeline_db, cfg.memory_iou_threshold,
+                        cfg.memory_static_n_captures, cfg.memory_static_min_hours)
+        notifier = Notifier(cfg.mattermost_base_url, cfg.mattermost_channel_id,
+                            cfg.mattermost_bot, cfg.secrets_mattermost)
+        dashboard: DashboardWriter | None = None
+        if cfg.dashboard_db_url:
+            try:
+                dashboard = DashboardWriter(cfg.dashboard_db_url, cfg.dashboard_local_data_dir,
+                                            cfg.dashboard_base_static_url)
+            except Exception as e:
+                log.error("dashboard unavailable, continuing alert-only: %s", e)
+                dashboard = None
+        subimage_dir = Path(cfg.subimage_dir)
+        subimage_dir.mkdir(parents=True, exist_ok=True)
+        n = requeue_deferred(cfg, client, detector, describer, memory, notifier,
+                             dashboard, subimage_dir,
+                             older_than_hours=cfg.requeue_older_than_hours)
+        memory.close()
+        if dashboard is not None:
+            dashboard.close()
+        log.info("requeue-deferred complete: %d captures", n)
         return
 
     backoff = cfg.poll_interval_seconds

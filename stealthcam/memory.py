@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS feedback (
     human_label TEXT NOT NULL,
     flagged_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS deferred_captures (
+    guid TEXT PRIMARY KEY,
+    deferral_count INTEGER NOT NULL DEFAULT 1,
+    alerted INTEGER NOT NULL DEFAULT 0,
+    first_deferred_at TEXT NOT NULL,
+    last_deferred_at TEXT NOT NULL
+);
 """
 
 
@@ -131,7 +138,68 @@ class Memory:
             "INSERT OR IGNORE INTO seen_guids (guid, seen_at) VALUES (?, ?)",
             (guid, _now()),
         )
+        # A capture that was previously deferred is now successfully seen —
+        # drop its deferral row so it no longer counts toward the alert
+        # threshold or the requeue backfill.
+        self._conn.execute("DELETE FROM deferred_captures WHERE guid = ?", (guid,))
         self._conn.commit()
+
+    # -- deferred captures ---------------------------------------------------
+
+    def record_deferral(self, guid: str) -> int:
+        """Record that a capture's sub-images all failed to download this poll.
+
+        Increments the deferral count (or inserts a new row) and returns the
+        new count. A capture that later downloads successfully is marked seen
+        and its deferral row is cleared (see mark_seen).
+        """
+        now = _now()
+        cur = self._conn.execute(
+            "SELECT deferral_count FROM deferred_captures WHERE guid = ?", (guid,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO deferred_captures "
+                "(guid, deferral_count, alerted, first_deferred_at, last_deferred_at) "
+                "VALUES (?, 1, 0, ?, ?)",
+                (guid, now, now),
+            )
+            count = 1
+        else:
+            count = row[0] + 1
+            self._conn.execute(
+                "UPDATE deferred_captures SET deferral_count = ?, last_deferred_at = ? "
+                "WHERE guid = ?",
+                (count, now, guid),
+            )
+        self._conn.commit()
+        return count
+
+    def is_deferred_alerted(self, guid: str) -> bool:
+        cur = self._conn.execute(
+            "SELECT alerted FROM deferred_captures WHERE guid = ?", (guid,)
+        )
+        row = cur.fetchone()
+        return bool(row and row[0])
+
+    def mark_deferred_alerted(self, guid: str) -> None:
+        self._conn.execute(
+            "UPDATE deferred_captures SET alerted = 1 WHERE guid = ?", (guid,)
+        )
+        self._conn.commit()
+
+    def clear_deferral(self, guid: str) -> None:
+        """Drop a capture's deferral row once it has been successfully seen."""
+        self._conn.execute("DELETE FROM deferred_captures WHERE guid = ?", (guid,))
+        self._conn.commit()
+
+    def deferred_guids(self) -> list[str]:
+        """Return the guids currently tracked as deferred (never marked seen)."""
+        rows = self._conn.execute(
+            "SELECT guid FROM deferred_captures ORDER BY last_deferred_at"
+        ).fetchall()
+        return [r[0] for r in rows]
 
     # -- object matching -----------------------------------------------------
 
