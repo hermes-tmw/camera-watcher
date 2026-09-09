@@ -120,7 +120,11 @@ def backfill(db_url: str, max_event_id: int | None = None,
         cur.execute(
             "INSERT INTO _backfill_markers "
             "(key, completed_at, event_rows, telemetry_rows) "
-            "VALUES (%s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET "
+            "completed_at = EXCLUDED.completed_at, "
+            "event_rows = EXCLUDED.event_rows, "
+            "telemetry_rows = EXCLUDED.telemetry_rows",
             (MARKER_KEY, datetime.now(), converted, sync_converted),
         )
         conn.commit()
