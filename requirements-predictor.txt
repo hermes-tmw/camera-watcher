@@ -1,8 +1,0 @@
-sqlalchemy>=2.0.12
-sshtunnel
-redis
-rq>=2.7.0
-pytz
-pillow
-fastai
-psycopg2-binary

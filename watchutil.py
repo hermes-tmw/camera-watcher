@@ -306,7 +306,6 @@ def main():
         'failed',
         'ioworker',
         'videoworker',
-        'predictionworker',
         'classifyworker',
         'backfill_classify',
         'singlevideo',
@@ -351,9 +350,6 @@ def main():
         elif args.action == 'videoworker':
             import watcher.video
             watcher.video.run_video_queue()
-        elif args.action == 'predictionworker':
-            import watcher.predict_still
-            watcher.predict_still.run_prediction_queue()
         elif args.action == 'classifyworker':
             import watcher.classify_motion
             watcher.classify_motion.run_classify_queue()
