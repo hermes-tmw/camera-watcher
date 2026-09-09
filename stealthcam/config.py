@@ -50,6 +50,9 @@ class Config:
     poll_backoff_max: int = 300
     poll_take_count: int = 20
 
+    deferred_alert_threshold: int = 3
+    requeue_older_than_hours: float = 24.0
+
     def __post_init__(self):
         self.secrets_stealthcam = os.path.expanduser(self.secrets_stealthcam)
         self.secrets_mattermost = os.path.expanduser(self.secrets_mattermost)
