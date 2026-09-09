@@ -235,14 +235,6 @@ def task_save_significant_frame(name):
 
             logger.info(f"found frame {sig_frame} for {name}. Will store as {img_relpath}")
 
-            # fastai predictor disabled in favour of ollama classifier
-            # predict_queue = Queue('prediction', connection=redis_connection())
-            # job = predict_queue.enqueue('watcher.predict_still.task_predict_still',
-            #                             depends_on=write_job,
-            #                             args=(str(img_relpath), name),
-            #                             retry=Retry(max=1, interval=17*60))
-            # logger.debug(f"enqueued prediction for {img_relpath} as {job.id}")
-
             classify_queue = Queue('classify_motion', connection=redis_connection())
             job = classify_queue.enqueue('watcher.classify_motion.task_classify_motion',
                                          args=(name,),

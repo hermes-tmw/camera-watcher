@@ -60,25 +60,6 @@ services:
       - WATCHER_LOG_FILE=/var/log/watcher/videoworker.log
     restart: always
 
-  predictor:
-    profiles: ["predictor", "all"]
-    build:
-      context: .
-      dockerfile: Dockerfile-predictor
-      args:
-        GIT_VERSION: ${GIT_VERSION:-}
-    command: ./watchutil.py predictionworker
-    depends_on:
-      - redis
-    volumes:
-      - /data/video:/data/video
-      - ./etc:/usr/local/etc:ro
-      - ./log:/var/log
-    environment:
-      - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
-      - WATCHER_LOG_FILE=/var/log/watcher/predictor.log
-    restart: always
-
   classifier:
     profiles: ["predictor", "all"]
     build:
