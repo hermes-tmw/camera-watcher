@@ -23,7 +23,7 @@ from unittest import mock
 import pytz
 
 from stealthcam.dashboard import DashboardWriter, CAMERA_TZ
-from stealthcam.backfill_tz import _mdt_naive_to_utc_naive
+from stealthcam.backfill_tz import _mdt_naive_to_utc_naive, backfill, MARKER_KEY
 
 
 class TestCaptureTimeNaive(unittest.TestCase):
@@ -116,6 +116,130 @@ class TestBackfillDstSafe(unittest.TestCase):
         out = _mdt_naive_to_utc_naive(datetime(2026, 1, 15, 10, 39, 32))
         self.assertIsNone(out.tzinfo)
         self.assertEqual(out, datetime(2026, 1, 15, 17, 39, 32))
+
+
+class _FakeCursor:
+    """Records executed SQL and returns canned rows for the backfill's queries.
+
+    Applies the ``id <= N`` cutoff to the canned rows so the conversion count
+    reflects what a real DB would return for the WHERE clause.
+    """
+
+    def __init__(self, event_rows, telemetry_rows, marker_present=False):
+        self.event_rows = event_rows
+        self.telemetry_rows = telemetry_rows
+        self.marker_present = marker_present
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def _last(self):
+        return self.executed[-1]
+
+    def fetchall(self):
+        sql, params = self._last()
+        if "event_observations" in sql:
+            rows = self.event_rows
+            if params:
+                max_id = params[0]
+                rows = [r for r in rows if r[0] <= max_id]
+            return rows
+        if "stealthcam_telemetry" in sql:
+            rows = self.telemetry_rows
+            if params:
+                max_id = params[0]
+                rows = [r for r in rows if r[0] <= max_id]
+            return rows
+        return []
+
+    def fetchone(self):
+        sql, _ = self._last()
+        if "_backfill_markers" in sql and "SELECT" in sql:
+            return (MARKER_KEY,) if self.marker_present else None
+        return None
+
+    def close(self):
+        pass
+
+
+class _FakeConn:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.committed = False
+        self.rolled_back = False
+
+    def cursor(self):
+        return self._cursor
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def close(self):
+        pass
+
+
+class TestBackfillGuard(unittest.TestCase):
+    def _run(self, event_rows, telemetry_rows, marker_present=False,
+             max_event_id=None, max_telemetry_id=None, force=False):
+        cur = _FakeCursor(event_rows, telemetry_rows, marker_present)
+        conn = _FakeConn(cur)
+        with mock.patch("stealthcam.backfill_tz.psycopg2.connect",
+                        return_value=conn):
+            return backfill(
+                "postgresql://fake/fake",
+                max_event_id=max_event_id,
+                max_telemetry_id=max_telemetry_id,
+                force=force,
+            ), cur, conn
+
+    def test_refuses_rerun_when_marker_present(self):
+        with self.assertRaises(RuntimeError):
+            self._run([], [], marker_present=True)
+
+    def test_force_overrides_marker(self):
+        (n_cap, n_sync), cur, conn = self._run(
+            [], [], marker_present=True, force=True)
+        self.assertEqual((n_cap, n_sync), (0, 0))
+        self.assertTrue(conn.committed)
+
+    def test_cutoff_filters_rows(self):
+        # Two event rows (ids 1, 2) and two telemetry rows (ids 1, 2).
+        event_rows = [
+            (1, datetime(2026, 9, 8, 10, 39, 32)),
+            (2, datetime(2026, 9, 8, 11, 0, 0)),
+        ]
+        telemetry_rows = [
+            (1, datetime(2026, 9, 8, 10, 0, 0)),
+            (2, datetime(2026, 9, 8, 11, 0, 0)),
+        ]
+        (n_cap, n_sync), cur, conn = self._run(
+            event_rows, telemetry_rows, max_event_id=1, max_telemetry_id=1)
+        # Only id <= 1 converted in each table.
+        self.assertEqual((n_cap, n_sync), (1, 1))
+        # The SELECTs carried the cutoff predicate.
+        event_select = [s for s, _ in cur.executed
+                        if "event_observations" in s][0]
+        telemetry_select = [s for s, _ in cur.executed
+                            if "stealthcam_telemetry" in s][0]
+        self.assertIn("id <= %s", event_select)
+        self.assertIn("id <= %s", telemetry_select)
+
+    def test_no_cutoff_converts_all(self):
+        event_rows = [(1, datetime(2026, 9, 8, 10, 39, 32))]
+        telemetry_rows = [(1, datetime(2026, 9, 8, 10, 0, 0))]
+        (n_cap, n_sync), cur, conn = self._run(event_rows, telemetry_rows)
+        self.assertEqual((n_cap, n_sync), (1, 1))
+        self.assertTrue(conn.committed)
+
+    def test_marker_written_on_success(self):
+        (n_cap, n_sync), cur, conn = self._run([], [])
+        marker_inserts = [s for s, _ in cur.executed
+                          if "INSERT INTO _backfill_markers" in s]
+        self.assertEqual(len(marker_inserts), 1)
 
 
 if __name__ == "__main__":
