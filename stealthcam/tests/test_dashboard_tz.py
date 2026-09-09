@@ -20,6 +20,7 @@ import unittest
 from datetime import datetime
 from unittest import mock
 
+import psycopg2.errors
 import pytz
 
 from stealthcam.dashboard import DashboardWriter, CAMERA_TZ
@@ -130,9 +131,23 @@ class _FakeCursor:
         self.telemetry_rows = telemetry_rows
         self.marker_present = marker_present
         self.executed = []
+        # Model the _backfill_markers PRIMARY KEY constraint so the fake is a
+        # true oracle: a second INSERT of the same key raises UniqueViolation,
+        # exactly as the real DB does.
+        self._marker_keys = {MARKER_KEY} if marker_present else set()
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
+        if "INSERT INTO _backfill_markers" in sql:
+            key = params[0]
+            if key in self._marker_keys and "ON CONFLICT" not in sql:
+                # A plain INSERT against an existing key violates the PK,
+                # exactly as the real DB does. The fixed code uses
+                # ON CONFLICT DO UPDATE, which upserts instead.
+                raise psycopg2.errors.UniqueViolation(
+                    "duplicate key value violates unique constraint "
+                    "\"_backfill_markers_pkey\"")
+            self._marker_keys.add(key)
 
     def _last(self):
         return self.executed[-1]
