@@ -27,7 +27,7 @@ class _FailingClient:
 
 
 class _EmptyDetector:
-    def detect(self, image):
+    def detect(self, image, conf_threshold=None):
         return []
 
 
@@ -141,7 +141,7 @@ class _RecordingProcessor:
         self.processed = []
 
     def __call__(self, capture, client, detector, describer, memory,
-                 notifier, dashboard, subimage_dir):
+                 notifier, dashboard, subimage_dir, **kwargs):
         self.processed.append(capture["imageGuid"])
         memory.mark_seen(capture["imageGuid"])
 

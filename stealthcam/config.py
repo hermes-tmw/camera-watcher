@@ -33,6 +33,21 @@ class Config:
     detector_conf_threshold: float = 0.6
     detector_device: str = "0"
 
+    # Night confidence gate (settled decision 4, data-backed 2026-09-13): at
+    # night the detector confidence bar is raised above the day value so IR
+    # background noise (<0.3 median) is suppressed. The eval over 59 night
+    # captures confirmed 0.75 eliminates ~96.8% of IR noise while keeping clear
+    # signals (2 real SUVs @ 0.86/0.85). Sub-threshold detections are dropped.
+    detector_night_conf_threshold: float = 0.75
+
+    # Day window (wall hours, US/Mountain) used to classify a capture as
+    # day/night for the night gate AND the presence-baseline denominator
+    # (settled decision 4: "configured dark hours"). Everything outside
+    # [day_start_hour, day_end_hour) is night. Defaults mirror the historical
+    # 7-20 window.
+    day_start_hour: int = 7
+    day_end_hour: int = 20
+
     describer_model: str = "llama3.2-vision:latest"
     describer_ollama_host: str = "http://localhost:11434"
     describer_timeout: int = 180
@@ -40,6 +55,43 @@ class Config:
     memory_static_n_captures: int = 5
     memory_static_min_hours: float = 1.0
     memory_iou_threshold: float = 0.5
+
+    # Entity identity (settled decisions 1 & 2). The re-id fingerprint is the
+    # identity KEY; the describer VLM supplies make/model + lettering
+    # attributes. Two crops are the same entity when their fingerprints match
+    # within ``reid_similarity_threshold`` (normalized-L2 similarity, 1 - dist;
+    # lowered to 0.80 after the v2 descriptor separated lookalikes).
+    reid_similarity_threshold: float = 0.80
+    reid_model: str = "cv2-silhouette-v2"
+
+    # Expected-presence baseline: per entity_id x direction, an entity is
+    # "typically here" when it is present in >= this fraction of monitored
+    # captures over the rolling window. Default >=50% over 7 days (settled
+    # decision 2), surfaced as config so it can be tuned. The denominator
+    # counts DAY captures only (night captures inflate it without adding
+    # numerator, since the night confidence gate drops most night detections).
+    entity_expected_presence_ratio: float = 0.5
+    entity_baseline_window_days: float = 7.0
+
+    # Hysteresis: once an entity is "expected" it stays expected (no alert)
+    # until it has been absent >= this many days, so a familiar vehicle at
+    # ~threshold presence does not flip between alert/note on every minor miss
+    # (occlusion, weather). Default 2 days.
+    entity_expected_absence_days: float = 2.0
+
+    # Location policy (settled decision 3). ``road`` = pass-by (note only, no
+    # alert); ``driveway`` = identity-expectedness eval (unfamiliar -> alert).
+    location_road: str = "road"
+    location_driveway: str = "driveway"
+
+    # Direction -> region mapping. The camera's sub-images are named by
+    # COMPASS bearing (e.g. "East", "South_SouthWest"); which bearing faces the
+    # driveway vs Wichita Rd is deployment knowledge we cannot infer. A
+    # comma-separated "bearing=region" list, e.g. "east=driveway,west=road".
+    # Direction names are matched case-insensitively by their leading token
+    # (before any underscore). Unmapped directions -> unclassified region ->
+    # novel-vehicle fallback policy.
+    direction_regions: str = ""
 
     dashboard_db_url: str = ""
     dashboard_base_static_url: str = "http://mira.local"

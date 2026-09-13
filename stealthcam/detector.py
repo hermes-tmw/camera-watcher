@@ -60,14 +60,21 @@ class Detector:
         self.conf_threshold = conf_threshold
         self.device = device
 
-    def detect(self, image: Image.Image | str | Path) -> list[Detection]:
-        """Run detection and return detections above the confidence threshold."""
+    def detect(self, image: Image.Image | str | Path,
+               conf_threshold: float | None = None) -> list[Detection]:
+        """Run detection and return detections above the confidence threshold.
+
+        ``conf_threshold`` overrides the instance default for this call. This
+        is how the worker raises the bar at night (``detector_night_conf_threshold``)
+        to suppress IR background noise, without mutating the detector's state.
+        """
+        bar = self.conf_threshold if conf_threshold is None else conf_threshold
         r = self._model.predict(image, verbose=False, device=self.device)[0]
         out: list[Detection] = []
         for box in r.boxes:
             cls_id = int(box.cls[0])
             conf = float(box.conf[0])
-            if conf < self.conf_threshold:
+            if conf < bar:
                 continue
             cls = COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else f"class{cls_id}"
             xyxy = box.xyxy[0].tolist()
