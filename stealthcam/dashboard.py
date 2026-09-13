@@ -22,6 +22,8 @@ from pathlib import Path
 import psycopg2
 import pytz
 
+from . import DECIDER
+
 CAMERA_TZ = "US/Mountain"
 
 
@@ -185,6 +187,42 @@ class DashboardWriter:
             )
             self._conn.commit()
             return event_id
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def write_event_labeling(self, event_id: int, category: str,
+                             confidence: float, description: str) -> int:
+        """Attach an entity-memory labeling to an EXISTING motion event row.
+
+        The motion pipeline (motion daemon -> on_movie_start hook ->
+        task_record_event) creates the EventObservation; the classify
+        pipeline adds its own VLM labeling; this adapter adds a THIRD labeling
+        carrying the entity-memory decision (tagged note or alert reason).
+        watcher.browser._ml_info renders the highest-id ML labeling, so as
+        long as this write lands after the classify labeling (the ingestor's
+        source query enforces that ordering) the dashboard card shows the
+        decision. No new EventObservation is created — one card per motion
+        event, exactly as the motion pipeline built it.
+
+        Returns the new labeling id. Raises on failure so the caller's error
+        path (log + continue) stays loud about dashboard degradation.
+        """
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO labelings "
+                "(decider, decided_at, labels, probabilities, description, git_version, event_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (DECIDER, datetime.now(), json.dumps([category]),
+                 json.dumps([confidence]), description, self.git_version,
+                 event_id),
+            )
+            row = cur.fetchone()
+            self._conn.commit()
+            if row is None:
+                raise RuntimeError("write_event_labeling: no id returned")
+            return int(row[0])
         except Exception:
             self._conn.rollback()
             raise

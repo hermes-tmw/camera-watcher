@@ -262,7 +262,44 @@ class Memory:
             from .reid import OpenCVFingerprinter
             fingerprinter = OpenCVFingerprinter()
         self.fingerprinter = fingerprinter
+        # Did THIS open create the file? Captured before connect (which
+        # materializes a 0-byte file) and passed to migrate_db_open — with
+        # WAL enabled at open, the file is no longer 0-byte by migration
+        # time, so the size heuristic alone can't distinguish fresh from
+        # legacy anymore (the caller's knowledge can).
+        db_is_new = not Path(self.db_path).is_file()
         self._conn = sqlite3.connect(self.db_path)
+        # Multi-writer readiness (2026-09-13, wichita ingestor): two scope
+        # processes (taylor_hill worker + wichita motion ingestor) share this
+        # one DB file. DELETE-journal mode serializes badly and fails readers
+        # during every writer's exclusive lock; WAL gives writer/reader
+        # concurrency with SQLITE_BUSY backoff via busy_timeout. Constraint:
+        # the file lives on NFS, where WAL is only safe when ALL accessors go
+        # through ONE NFS client host — true for every deployed accessor
+        # (all containers run on mira), and the deploy convention keeps the
+        # CLI/backfill on mira too. Refuse to run if WAL can't be enabled:
+        # silently staying in DELETE mode would re-introduce the "database is
+        # locked" alert-storm exactly when the second scope goes live.
+        # ':memory:' DBs are exempt BY CONSTRUCTION — they are
+        # single-connection (no second process can attach), so the multi-
+        # writer hazard WAL guards against does not exist, and SQLite has no
+        # WAL mode for them anyway.
+        self._conn.execute("PRAGMA busy_timeout = 10000")
+        if self.db_path != ":memory:":
+            try:
+                mode = self._conn.execute(
+                    "PRAGMA journal_mode=WAL").fetchone()[0]
+            except sqlite3.OperationalError as e:
+                self._conn.close()
+                raise RuntimeError(
+                    f"{self.db_path}: cannot enable WAL journal mode needed "
+                    f"for multi-scope concurrent access: {e}") from e
+            if str(mode).lower() != "wal":
+                self._conn.close()
+                raise RuntimeError(
+                    f"{self.db_path}: journal_mode=WAL returned {mode!r} — the "
+                    f"filesystem does not support WAL. Multi-scope concurrent "
+                    f"access requires WAL (or a move off this filesystem).")
         # Migrate BEFORE executing the schema: on a legacy DB the scoped
         # indexes in _SCHEMA reference a scope column the old tables don't
         # have yet. migrate_db_open takes the one-time pre-migration backup
@@ -280,7 +317,8 @@ class Memory:
         # stamped with a DIFFERENT epoch still gets the full check.
         cur_epoch = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if cur_epoch != SCHEMA_EPOCH_USER_VERSION:
-            report = migrate_db_open(self.db_path, self._conn)
+            report = migrate_db_open(self.db_path, self._conn,
+                                     db_is_new=db_is_new)
             if report["status"] != "already-scoped":
                 log.info("pipeline DB migrated at open: %s (%d tables)",
                          report["status"], len(report.get("tables", {})))
@@ -743,6 +781,18 @@ class Memory:
             (self.scope, entity_id, direction),
         ).fetchone()
         return row[0] if row and row[0] is not None else None
+
+    def count_entities(self) -> int:
+        """Number of entities in this scope (baseline-seeding sanity check)."""
+        return int(self._conn.execute(
+            "SELECT COUNT(*) FROM entities WHERE scope = ?",
+            (self.scope,)).fetchone()[0])
+
+    def count_monitored(self) -> int:
+        """Number of monitored-capture rows in this scope (same check)."""
+        return int(self._conn.execute(
+            "SELECT COUNT(*) FROM monitored_captures WHERE scope = ?",
+            (self.scope,)).fetchone()[0])
 
     # -- decisions / feedback (feedback-loop data) ---------------------------
 
