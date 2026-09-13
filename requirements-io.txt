@@ -9,6 +9,7 @@ redis
 rq>=2.7.0
 requests-toolbelt>=0.9.1
 pytz
+alembic>=1.13.0
 pyuwsgi
 pillow
 psycopg2-binary
