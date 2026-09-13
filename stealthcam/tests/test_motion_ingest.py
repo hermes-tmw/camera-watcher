@@ -334,10 +334,11 @@ class TestMotionEventSource(unittest.TestCase):
             "id": 42, "event_name": "ev42", "capture_time": ct,
             "scene_name": "WichitaDriveway",
             "video_location": "wichitaDriveway/2026/09/13",
+            "video_file": "20260913_120000_WichitaDriveway_42_0000.mp4",
             "frame_file": "wichitaDriveway/2026/09/13/ev42_f3.jpg",
         }]
         src, captured = self._make(rows)
-        events = src.poll(limit=200)
+        events = src.poll()
         self.assertEqual(len(events), 1)
         ev = events[0]
         self.assertEqual(ev.event_id, 42)
@@ -346,14 +347,42 @@ class TestMotionEventSource(unittest.TestCase):
         self.assertEqual(ev.scene_name, "WichitaDriveway")
         self.assertEqual(ev.frame_relpath,
                          "wichitaDriveway/2026/09/13/ev42_f3.jpg")
+        self.assertEqual(ev.video_file,
+                         "20260913_120000_WichitaDriveway_42_0000.mp4")
         sql = captured["sql"]
         self.assertIn("task_save_significant_frame", sql)
         self.assertIn("e.camera = ANY", sql)
         self.assertIn("e.storage_local", sql)
+        self.assertIn("e.video_file", sql)
         self.assertIn("decider LIKE 'ollama:%%'", sql)
         self.assertIn("ORDER BY e.capture_time ASC", sql)
+        # P0-1: NO SQL LIMIT — the 12h window is the bound; the seen-filter
+        # runs in python and the new-work cap is applied AFTER it.
+        self.assertNotIn("LIMIT", sql.upper().replace("LIMIT 200", ""))
+        self.assertNotRegex(sql, r"LIMIT\s+%")
         self.assertEqual(captured["params"]["scenes"], ["WichitaDriveway"])
-        self.assertEqual(captured["params"]["limit"], 200)
+        self.assertNotIn("limit", captured["params"])
+        src.close()
+
+    def test_poll_no_sql_limit_starvation_regression(self):
+        """Percy PR#43 P0-1: with a window population >= the old LIMIT 200,
+        every in-window event must come back (the seen-filter in
+        process_batch, not SQL, decides what is new)."""
+        ct0 = datetime(2026, 9, 13, 0, 0, 0)
+        n = 450  # observed 317-428 in-window; 450 > 200 with margin
+        rows = [{
+            "id": i, "event_name": f"ev{i}", "capture_time": ct0,
+            "scene_name": "WichitaDriveway",
+            "video_location": "wichitaDriveway/2026/09/13",
+            "video_file": f"20260913_000000_WichitaDriveway_{i}_0000.mp4",
+            "frame_file": f"wichitaDriveway/2026/09/13/ev{i}_f3.jpg",
+        } for i in range(n)]
+        src, _ = self._make(rows)
+        events = src.poll()
+        self.assertEqual(len(events), n)  # all 450, not the first 200
+        # oldest-first ordering preserved
+        self.assertEqual(events[0].event_name, "ev0")
+        self.assertEqual(events[-1].event_name, f"ev{n - 1}")
         src.close()
 
 
@@ -640,7 +669,211 @@ class TestProcessEventRunner(unittest.TestCase):
         m.close()
 
 
-# -- 7. dashboard labeling write path -----------------------------------------
+# -- 7. process_batch starvation + backfill drain (Percy P0-1 / P1-2) ----------
+
+
+class TestProcessBatchLargeWindow(unittest.TestCase):
+    """P0-1 regression at the batch level: window population >= the old
+    LIMIT; unseen quota applies to NEW work after the python seen-filter."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "pipeline.db")
+        _write_frame(Path(self.tmp.name) / "frames" / "ev_f3.jpg")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _events(self, n: int, prefix: str = "ev"):
+        import stealthcam.motion_ingest as mi
+        return [mi.MotionEvent(i, f"{prefix}{i}", _T0, "WichitaDriveway",
+                               "wichitaDriveway/2026/09/13",
+                               "frames/ev_f3.jpg",
+                               video_file=f"20260913_000000_w_{i}_0000.mp4")
+                for i in range(n)]
+
+    def _cfg(self):
+        from stealthcam.config import Config
+        cfg = Config()
+        cfg.memory_scope = "wichita"
+        cfg.pipeline_db = self.db
+        cfg.dashboard_local_data_dir = self.tmp.name
+        return cfg
+
+    def _src(self, events):
+        import stealthcam.motion_ingest as mi
+        src = mi.MotionEventSource.__new__(mi.MotionEventSource)
+        src.scenes = ["WichitaDriveway"]
+        src.lookback_hours = 12.0
+        src._db_url = "postgresql://fake"
+        src.poll = lambda: list(events)  # type: ignore[method-assign]
+        src.close = lambda: None  # type: ignore[method-assign]
+        return src
+
+    def test_window_over_limit_newest_not_starved(self):
+        """THE P0-1 shape: 450 in-window events, 250 already seen. The old
+        code (SQL LIMIT 200 oldest-first, seen-filter after) would process
+        ZERO of the 200 newest. The cap must land on unseen work."""
+        import stealthcam.motion_ingest as mi
+        events = self._events(450)
+        m = _mk(self.db, "wichita")
+        for e in events[:250]:
+            m.mark_seen(e.event_name)
+        # 200 unseen: ev250..ev449 (the NEWEST cohort — previously invisible)
+        cfg = self._cfg()
+        road_orig = mi._road_band
+        mi._road_band = lambda c: {"y_max": 0.42, "x_min": 0.30, "x_max": 0.52}
+        try:
+            src = self._src(events)
+            detector = _FixedDetector([
+                _mk_detection("car", 0.72, (500.0, 259.0, 576.0, 288.0))])
+            totals = mi.process_batch(cfg, src, m, detector, None, None,
+                                      None, Path(self.tmp.name) / "sub",
+                                      baseline_mode=True, new_limit=200)
+        finally:
+            mi._road_band = road_orig
+        self.assertEqual(totals["new"], 200)
+        self.assertEqual(totals["processed"], 200)
+        # the newest events got processed, not the oldest seen cohort
+        self.assertTrue(m.has_seen("ev449"))
+        self.assertTrue(m.has_seen("ev250"))
+        m.close()
+
+    def test_no_new_limit_processes_all_unseen(self):
+        import stealthcam.motion_ingest as mi
+        events = self._events(305)  # > any legacy 200 LIMIT
+        m = _mk(self.db, "wichita")
+        cfg = self._cfg()
+        road_orig = mi._road_band
+        mi._road_band = lambda c: {"y_max": 0.42, "x_min": 0.30, "x_max": 0.52}
+        try:
+            src = self._src(events)
+            detector = _FixedDetector([])  # no detections: cheap pass
+            totals = mi.process_batch(cfg, src, m, detector, None, None,
+                                      None, Path(self.tmp.name) / "sub",
+                                      baseline_mode=True)
+        finally:
+            mi._road_band = road_orig
+        self.assertEqual(totals["new"], 305)
+        self.assertEqual(totals["processed"], 305)
+        m.close()
+
+    def test_frameless_events_left_unseen_and_counted(self):
+        """P1-1 loud-drop: frameless events are counted (no_frame_dropped),
+        stay unseen (retry within window), and never hit the seen-set."""
+        import stealthcam.motion_ingest as mi
+        events = self._events(3)
+        for e in events:
+            e.frame_relpath = "frames/missing_f3.jpg"
+        m = _mk(self.db, "wichita")
+        cfg = self._cfg()
+        road_orig = mi._road_band
+        mi._road_band = lambda c: {"y_max": 0.42, "x_min": 0.30, "x_max": 0.52}
+        try:
+            src = self._src(events)
+            totals = mi.process_batch(cfg, src, m, _FixedDetector([]), None,
+                                      None, None, Path(self.tmp.name) / "sub",
+                                      baseline_mode=True)
+        finally:
+            mi._road_band = road_orig
+        self.assertEqual(totals["no_frame_dropped"], 3)
+        self.assertEqual(totals["processed"], 0)
+        for e in events:
+            self.assertFalse(m.has_seen(e.event_name))
+        m.close()
+
+
+class TestBackfillDrainLoop(unittest.TestCase):
+    """P1-2: backfill drains the window (loops until processed == 0), not a
+    single event_backlog_max slice."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "pipeline.db")
+        _write_frame(Path(self.tmp.name) / "frames" / "ev_f3.jpg")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _cfg(self):
+        from stealthcam.config import Config
+        cfg = Config()
+        cfg.memory_scope = "wichita"
+        cfg.pipeline_db = self.db
+        cfg.dashboard_local_data_dir = self.tmp.name
+        cfg.event_backlog_max = 40  # small slices force multiple passes
+        return cfg
+
+    def test_drain_processes_full_window_across_passes(self):
+        import stealthcam.motion_ingest as mi
+        n = 95  # 95 unseen events / backlog_max 40 -> passes 40 + 40 + 15 + 0
+        events = []
+        for i in range(n):
+            e = mi.MotionEvent(i, f"ev{i}", _T0, "WichitaDriveway",
+                               "wichitaDriveway/2026/09/13",
+                               "frames/ev_f3.jpg", video_file=f"v{i}.mp4")
+            events.append(e)
+        m = _mk(self.db, "wichita")
+        src = mi.MotionEventSource.__new__(mi.MotionEventSource)
+        src.scenes = ["WichitaDriveway"]
+        src.lookback_hours = 48.0
+        src._db_url = "postgresql://fake"
+        src.poll = lambda: list(events)  # type: ignore[method-assign]
+        src.close = lambda: None  # type: ignore[method-assign]
+        detector = _FixedDetector([])  # no detections: cheap, marks seen
+        total = mi._backfill_drain(self._cfg(), src, m, detector,
+                                   Path(self.tmp.name) / "sub", backlog_max=40)
+        self.assertEqual(total, n)
+        # _backfill_drain closes the memory handle in its finally block —
+        # re-open to assert on the persisted seen-set.
+        m2 = _mk(self.db, "wichita")
+        for e in events:
+            self.assertTrue(m2.has_seen(e.event_name))
+        m2.close()
+
+    def test_drain_stops_with_loud_error_on_persistent_failures(self):
+        # events whose processing ALWAYS raises stay unseen -> drain must
+        # stop (not spin) and count them as NOT seeded.
+        import stealthcam.motion_ingest as mi
+        events = self._failing_events(3)
+        m = _mk(self.db, "wichita")
+        src = mi.MotionEventSource.__new__(mi.MotionEventSource)
+        src.scenes = ["WichitaDriveway"]
+        src.lookback_hours = 48.0
+        src._db_url = "postgresql://fake"
+        src.poll = lambda: list(events)  # type: ignore[method-assign]
+        src.close = lambda: None  # type: ignore[method-assign]
+        detector = _BoomDetector()
+        total = mi._backfill_drain(self._cfg(), src, m, detector,
+                                   Path(self.tmp.name) / "sub", backlog_max=40)
+        self.assertEqual(total, 0)
+        # _backfill_drain closes the memory handle in its finally block —
+        # re-open to assert the failing events were never marked seen.
+        m2 = _mk(self.db, "wichita")
+        for e in events:
+            self.assertFalse(m2.has_seen(e.event_name))
+        m2.close()
+
+    def _failing_events(self, n: int):
+        import stealthcam.motion_ingest as mi
+        out = []
+        for i in range(n):
+            e = mi.MotionEvent(i, f"bad{i}", _T0, "WichitaDriveway",
+                               "wichitaDriveway/2026/09/13",
+                               "frames/ev_f3.jpg", video_file=f"b{i}.mp4")
+            out.append(e)
+        return out
+
+
+class _BoomDetector:
+    """Detector whose detect() always raises — simulates a persistently
+    failing event (stays unseen, never marked seen)."""
+
+    def detect(self, image, conf_threshold=None):
+        raise RuntimeError("boom")
+
+
+# -- 8. dashboard labeling write path -----------------------------------------
 
 
 class TestWriteEventLabeling(unittest.TestCase):
@@ -694,6 +927,50 @@ class TestWriteEventLabeling(unittest.TestCase):
 
 
 # -- 8. config surface ---------------------------------------------------------
+
+
+class TestCliArgs(unittest.TestCase):
+    """Percy P3: --backfill-days as last argv raised IndexError; without
+    --backfill it was silently ignored. argparse fixes both."""
+
+    def test_backfill_days_last_token_ok(self):
+        from stealthcam.motion_ingest import _parse_args
+        args = _parse_args(["--backfill", "--backfill-days", "3"])
+        self.assertEqual(args.backfill_days, 3.0)
+        self.assertTrue(args.backfill)
+        self.assertFalse(args.once)
+
+    def test_backfill_days_missing_value_is_error(self):
+        from stealthcam.motion_ingest import _parse_args
+        with self.assertRaises(SystemExit):
+            _parse_args(["--backfill", "--backfill-days"])
+
+    def test_backfill_days_without_backfill_is_ignored_not_fatal(self):
+        # Percy P3 wanted this not silently IGNORED in a way that changes
+        # behavior; argparse accepts it (it's a plain option with a default)
+        # but only --backfill consumes it. The old IndexError shape (missing
+        # value at end of argv) IS fatal.
+        from stealthcam.motion_ingest import _parse_args
+        args = _parse_args(["--backfill-days", "3"])
+        self.assertEqual(args.backfill_days, 3.0)
+        self.assertFalse(args.backfill)
+
+    def test_backfill_days_rejects_nonpositive(self):
+        from stealthcam.motion_ingest import _parse_args
+        with self.assertRaises(SystemExit):
+            _parse_args(["--backfill", "--backfill-days", "0"])
+
+    def test_once_and_backfill_mutually_exclusive(self):
+        from stealthcam.motion_ingest import _parse_args
+        with self.assertRaises(SystemExit):
+            _parse_args(["--once", "--backfill"])
+
+    def test_defaults(self):
+        from stealthcam.motion_ingest import _parse_args
+        args = _parse_args([])
+        self.assertFalse(args.backfill)
+        self.assertFalse(args.once)
+        self.assertEqual(args.backfill_days, 2.0)
 
 
 class TestWichitaScopeConfig(unittest.TestCase):

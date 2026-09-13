@@ -30,17 +30,23 @@ Run modes:
   python -m stealthcam.motion_ingest --backfill      # baseline seeding, exit
   python -m stealthcam.motion_ingest --backfill --backfill-days 3
 
+Runbook (window-recovery): if the ingest pipeline (classify labeling or this
+adapter) is down for longer than the 12h lookback window, events that aged
+out were dropped (loudly — see the no_frame_dropped / failed-event ERROR
+logs). Recover the dropped span with a widened backfill AFTER service is
+restored: `python -m stealthcam.motion_ingest --backfill --backfill-days N`
+(N = outage span + margin; baseline mode, no alerts posted).
+
 Deploy ordering (same P0-2 invariant as the Taylor go-live): run --backfill
 BEFORE starting the live loop so the wichita scope's presence baseline
 (monitored-captures denominator + entity fingerprints) is seeded before the
 first live decision. An empty baseline makes every driveway vehicle
-"unfamiliar" on first sight (alert storm). The live loop logs a loud warning
-when it starts against an empty baseline.
+"unfamiliar" on first sight (one alert, then self-healing — see backfill());
+the live loop logs a loud warning when it starts against an empty baseline.
 """
 from __future__ import annotations
 
 import logging
-import subprocess  # noqa: S404 - ffmpeg frame extraction, fixed argv, timeout
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -80,10 +86,11 @@ class MotionEvent:
     """One motion event ready for entity-memory processing."""
 
     __slots__ = ("event_id", "event_name", "capture_time", "scene_name",
-                 "video_location", "frame_relpath")
+                 "video_location", "video_file", "frame_relpath")
 
     def __init__(self, event_id: int, event_name: str, capture_time: datetime,
-                 scene_name: str, video_location: str, frame_relpath: str):
+                 scene_name: str, video_location: str, frame_relpath: str,
+                 video_file: str = ""):
         self.event_id = event_id
         self.event_name = event_name
         # The capture_time column is naive UTC (container-local convention,
@@ -94,6 +101,7 @@ class MotionEvent:
         self.capture_time = capture_time
         self.scene_name = scene_name
         self.video_location = video_location
+        self.video_file = video_file
         self.frame_relpath = frame_relpath
 
     @property
@@ -122,16 +130,30 @@ class MotionEventSource:
     def close(self) -> None:
         self._conn.close()
 
-    def poll(self, limit: int) -> list[MotionEvent]:
-        """Events in the lookback window with significant frame + classify VLM
-        labeling, oldest first. Requiring an existing `ollama:%` labeling
-        orders this adapter's labeling AFTER the classify pipeline's on every
-        event (highest ML-labeling id wins the dashboard display), and makes
-        "classify pipeline up" an implicit readiness gate for each event."""
+    def poll(self) -> list[MotionEvent]:
+        """ALL in-window events with significant frame + classify VLM
+        labeling, oldest first — NO SQL LIMIT.
+
+        The seen-filter runs in python (Postgres cannot see the SQLite
+        seen_guids set), so a SQL LIMIT here would bound re-fetching of
+        already-seen rows, not new work: once the in-window population
+        exceeds the limit (observed 317–428 events in the 12h window vs a
+        200 LIMIT), every cycle re-fetches the same oldest cohort and the
+        newest events are never fetched until the seen cohort ages out
+        (Percy PR#43 P0-1 starvation). The 12h lookback window is the
+        natural bound on the query; the per-cycle NEW-work cap lives in
+        process_batch, applied AFTER the seen-filter.
+
+        Requiring an existing `ollama:%` labeling orders this adapter's
+        labeling AFTER the classify pipeline's on every event (highest
+        ML-labeling id wins the dashboard display), and makes "classify
+        pipeline up" an implicit readiness gate for each event.
+        """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=self.lookback_hours)
         sql = """
             SELECT e.id, e.event_name, e.capture_time, e.scene_name,
-                   e.video_location, ir.file AS frame_file
+                   e.video_location, e.video_file,
+                   ir.file AS frame_file
             FROM event_observations e
             JOIN intermediate_results ir
               ON ir.event_id = e.id AND ir.step = 'task_save_significant_frame'
@@ -141,16 +163,15 @@ class MotionEventSource:
               AND EXISTS (SELECT 1 FROM labelings l
                           WHERE l.event_id = e.id AND l.decider LIKE 'ollama:%%')
             ORDER BY e.capture_time ASC
-            LIMIT %(limit)s
         """
         with self._conn.cursor(
                 cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, {"scenes": self.scenes, "cutoff": cutoff,
-                              "limit": limit})
+            cur.execute(sql, {"scenes": self.scenes, "cutoff": cutoff})
             rows = cur.fetchall()
         return [MotionEvent(r["id"], r["event_name"], r["capture_time"],
                             r["scene_name"], r["video_location"],
-                            r["frame_file"]) for r in rows]
+                            r["frame_file"], video_file=r["video_file"])
+                for r in rows]
 
     def ready_but_unlabeled(self) -> int:
         """Count windowed events whose significant frame exists but which no
@@ -181,28 +202,18 @@ def _frame_abs_path(local_data_dir: str, event: MotionEvent) -> Path | None:
     return p if p.is_file() else None
 
 
-def _extract_frame_fallback(mp4: Path, dest: Path, timeout: int = 60) -> bool:
-    """Extract frame 0 of the event video as a JPEG fallback.
-
-    Used only when the saved significant-frame JPEG is missing (e.g. thumb GC)
-    but the MP4 exists — keeps a frameless event from being silently dropped.
-    """
-    if not mp4.is_file():
-        return False
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        r = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["ffmpeg", "-y", "-i", str(mp4), "-frames:v", "1", str(dest)],
-            capture_output=True, timeout=timeout,
-        )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        log.error("ffmpeg extract failed for %s: %s", mp4, e)
-        return False
-    if r.returncode != 0:
-        log.error("ffmpeg extract rc=%d for %s: %s", r.returncode, mp4,
-                  r.stderr.decode(errors="replace")[-200:])
-        return False
-    return dest.is_file()
+# Percy PR#43 P1-1: the previous ffmpeg fallback here was removed. It built
+# `{video_location}/{event_name}.mp4` (the on-disk convention is
+# `{event_name}_{HHMM}.mp4`, carried in `e.video_file`), so it could never
+# find the video; and `-frames:v 1` extracts the PRE-MOTION empty scene, so
+# even a "working" fallback would run the detector on an empty frame, mark
+# the event seen, and silently record a visitor mid-clip as a no-detection
+# capture — worse than dropping the event. There is no safe cheap
+# re-extraction here (approximate `-ss` seeking can still land on the wrong
+# frame silently), so a missing significant-frame JPEG now retries within
+# the lookback window (video-worker lag) and then drops LOUDLY: the
+# per-cycle `no_frame_dropped` count in process_batch logs an ERROR naming
+# every event that left the window frameless.
 
 
 # -- per-event processing -----------------------------------------------------
@@ -229,18 +240,18 @@ def process_event(event: MotionEvent, detector: Detector,
 
     frame = _frame_abs_path(local_data_dir, event)
     if frame is None:
-        mp4 = (Path(local_data_dir) / event.video_location
-               / f"{event.event_name}.mp4")
-        fallback = subimage_dir / f"{event.event_name}_f0.jpg"
-        if _extract_frame_fallback(mp4, fallback):
-            frame = fallback
-            log.warning("significant frame missing for %s; used ffmpeg "
-                        "fallback %s", event.event_name, fallback)
-    if frame is None:
         # Not marked seen: the frame may appear later (video worker lag) and
-        # the event leaves the window (and is dropped) after the lookback.
+        # the event leaves the window (and is dropped — loudly, see
+        # process_batch) after the lookback. No ffmpeg fallback: it extracted
+        # the pre-motion frame 0 and silently mis-recorded visitors (P1-1).
+        # The log names the source clip (e.video_file is the true on-disk
+        # filename, `{event_name}_{HHMM}.mp4`) so an operator can check the
+        # video worker's output directly.
+        clip = (f"{event.video_location}/{event.video_file}"
+                if event.video_file else "unknown (no video_file in DB row)")
         log.warning("event %s: no significant frame on disk, skipping "
-                    "(will retry within lookback window)", event.event_name)
+                    "(will retry within lookback window); source clip: %s",
+                    event.event_name, clip)
         summary["no_frame"] = True
         return summary
 
@@ -417,12 +428,23 @@ def process_batch(cfg, source: MotionEventSource, memory: Memory,
                   detector: Detector, describer: Describer | None,
                   notifier: Notifier | None, dashboard: DashboardWriter | None,
                   subimage_dir: Path, *, baseline_mode: bool = False,
-                  limit: int = 200) -> dict:
-    """Process up to ``limit`` unseen events; returns batch totals."""
-    events = source.poll(limit=limit)
+                  new_limit: int | None = None) -> dict:
+    """Process unseen in-window events; returns batch totals.
+
+    The source returns ALL in-window events (no SQL LIMIT — Percy P0-1);
+    the seen-filter runs here in python, and ``new_limit`` caps how many
+    NEW (unseen) events are processed this call. The cap therefore bounds
+    new work (the VLM drain), never re-fetching of seen rows.
+    """
+    events = source.poll()
     new = [e for e in events if not memory.has_seen(e.event_name)]
+    if new_limit is not None:
+        # Oldest-first keeps ordering stable; the remainder stays unseen and
+        # is picked up next cycle (or by the backfill drain loop).
+        new = new[:new_limit]
     totals = {"seen_in_window": len(events), "new": len(new), "alerts": 0,
-              "notes": 0, "flags": 0, "detections": 0, "processed": 0}
+              "notes": 0, "flags": 0, "detections": 0, "processed": 0,
+              "no_frame_dropped": 0}
     road = _road_band(cfg)
     night_conf = float(cfg.scope_setting(
         cfg.memory_scope, "detector_night_conf_threshold", 0.75))
@@ -446,6 +468,13 @@ def process_batch(cfg, source: MotionEventSource, memory: Memory,
             # One bad event must not wedge the batch; it stays unseen and is
             # retried until it ages out of the lookback window.
             log.error("event %s failed: %s", event.event_name, e)
+            continue
+        if s.get("no_frame"):
+            # Frameless: stays unseen (retry within window), counted loudly,
+            # and NOT counted as processed (the backfill drain relies on
+            # processed==0 to mean "nothing more to do").
+            totals["no_frame_dropped"] += 1
+            log.info("event %s: no frame, deferred", event.event_name)
             continue
         totals["processed"] += 1
         totals["alerts"] += s["alerts"]
@@ -471,19 +500,35 @@ def run_once(cfg) -> dict:
         cfg.scope_setting(cfg.memory_scope, "describer_model",
                           "llama3.2-vision:latest"),
         cfg.describer_ollama_host, cfg.describer_timeout)
-    notifier = Notifier(cfg.mattermost_base_url, cfg.mattermost_channel_id,
-                        cfg.mattermost_bot, cfg.secrets_mattermost)
+    # Degradation policy (deliberate, symmetric with _make_dashboard): a
+    # broken notifier degrades to alert-logged-not-posted, never kills the
+    # cycle — every suppressed alert still surfaces loudly in the logs.
+    notifier = None
+    try:
+        notifier = Notifier(cfg.mattermost_base_url, cfg.mattermost_channel_id,
+                            cfg.mattermost_bot, cfg.secrets_mattermost)
+    except Exception as e:
+        log.error("notifier unavailable, continuing alert-logged-only: %s", e)
     dashboard = _make_dashboard(cfg)
     subimage_dir = Path(cfg.subimage_dir)
     subimage_dir.mkdir(parents=True, exist_ok=True)
     try:
         result = process_batch(cfg, source, memory, detector, describer,
                                notifier, dashboard, subimage_dir,
-                               baseline_mode=False)
+                               baseline_mode=False,
+                               new_limit=int(cfg.event_backlog_max))
         unlabeled = source.ready_but_unlabeled()
         if unlabeled:
             log.warning("%d windowed events await classify labeling "
                         "(ingestor waiting on them)", unlabeled)
+        if result.get("no_frame_dropped"):
+            # Loud drop (Percy P1-1): frameless events that exhausted their
+            # lookback window must never disappear silently.
+            log.error("%d in-window event(s) had no significant frame on "
+                      "disk and were left unseen; they will drop out of the "
+                      "%dh lookback window unprocessed — investigate the "
+                      "video worker / thumb GC",
+                      result["no_frame_dropped"], int(LOOKBACK_HOURS))
         return result
     finally:
         memory.close()
@@ -497,6 +542,14 @@ def backfill(cfg, backfill_days: float = 2.0) -> int:
 
     MUST run before the live loop (P0-2): without a seeded baseline the first
     live driveway sighting of the resident vehicle is "unfamiliar" -> alert.
+    Drains the window: loops process_batch until it returns processed == 0,
+    so the full ``--backfill-days`` window is seeded, not just the first
+    event_backlog_max slice (Percy P1-2: 48h held ~2,700 eligible events vs
+    a 200 LIMIT — a 7.5% baseline seeded from the oldest day). An
+    empty/partial baseline is self-healing rather than alert-storm-prone
+    (first sighting ratio 0.0 -> one unfamiliar ALERT, then converges), so
+    backfill-before-live is ENFORCED HERE BY WARNING + draining, not by a
+    hard refusal (which would wedge a genuinely new site with no history).
     Returns the number of events processed.
     """
     source = MotionEventSource(cfg.dashboard_db_url,
@@ -510,18 +563,73 @@ def backfill(cfg, backfill_days: float = 2.0) -> int:
                         cfg.detector_device)
     subimage_dir = Path(cfg.subimage_dir)
     subimage_dir.mkdir(parents=True, exist_ok=True)
+    return _backfill_drain(cfg, source, memory, detector, subimage_dir,
+                           backlog_max=int(cfg.event_backlog_max))
+
+
+def _backfill_drain(cfg, source: MotionEventSource, memory: Memory,
+                    detector: Detector, subimage_dir: Path,
+                    *, backlog_max: int) -> int:
+    """Drain the source's window: loop process_batch until a pass processes
+    nothing. Testable seam — the source/memory/detector are injected."""
+    total = 0
     try:
-        result = process_batch(cfg, source, memory, detector, None, None,
-                               None, subimage_dir, baseline_mode=True,
-                               limit=int(cfg.event_backlog_max))
-        return result.get("processed", 0)
+        # Drain: each pass consumes up to backlog_max NEW events (the cap
+        # applies to unseen work, never to re-fetching seen rows); loop
+        # until a pass processes nothing. The guard trips on a pathological
+        # cycle where events persistently fail AND stay unseen (the only
+        # way processed can return to 0 without the window draining).
+        for pass_num in range(1, 1000):
+            result = process_batch(cfg, source, memory, detector, None, None,
+                                   None, subimage_dir, baseline_mode=True,
+                                   new_limit=backlog_max)
+            n = result.get("processed", 0)
+            total += n
+            log.info("backfill pass %d: %s", pass_num, result)
+            if n == 0:
+                remaining = result.get("new", 0)
+                if remaining:
+                    log.error(
+                        "backfill stopped with %d unseen event(s) that "
+                        "failed processing (repeatedly erroring) — these "
+                        "are NOT seeded; investigate before going live",
+                        remaining)
+                break
+        else:
+            log.error("backfill hit the 999-pass drain guard — aborting "
+                      "(window not fully drained)")
     finally:
         memory.close()
         source.close()
+    return total
+
+
+def _parse_args(argv: list[str]):
+    """argparse (Percy P3): `--backfill-days` as the last argv token used to
+    raise IndexError, and `--backfill-days` without `--backfill` was silently
+    ignored. Both are now argparse errors."""
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="python -m stealthcam.motion_ingest",
+        description="Wichita motion-event ingestor adapter (entity-memory "
+                    "scope adapter over camera-watcher motion events)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true",
+                      help="single poll cycle, then exit")
+    mode.add_argument("--backfill", action="store_true",
+                      help="baseline seeding pass (drains the window), then "
+                           "exit; run BEFORE the live loop (P0-2)")
+    p.add_argument("--backfill-days", type=float, default=2.0,
+                   help="lookback window for --backfill (default: 2.0 days)")
+    args = p.parse_args(argv)
+    if args.backfill_days <= 0:
+        p.error("--backfill-days must be positive")
+    return args
 
 
 def main() -> None:
     _setup_logging()
+    args = _parse_args(sys.argv[1:])
     cfg = load_config()
     scenes = cfg.scope_setting(cfg.memory_scope, "event_scenes", [])
     if not scenes:
@@ -530,15 +638,12 @@ def main() -> None:
                   cfg.memory_scope)
         sys.exit(2)
 
-    if "--backfill" in sys.argv:
-        days = 2.0
-        if "--backfill-days" in sys.argv:
-            days = float(sys.argv[sys.argv.index("--backfill-days") + 1])
-        n = backfill(cfg, backfill_days=days)
+    if args.backfill:
+        n = backfill(cfg, backfill_days=args.backfill_days)
         log.info("backfill complete: %d events", n)
         return
 
-    if "--once" in sys.argv:
+    if args.once:
         result = run_once(cfg)
         log.info("once done: %s", result)
         return
