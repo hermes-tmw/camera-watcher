@@ -40,6 +40,14 @@ class Config:
     # signals (2 real SUVs @ 0.86/0.85). Sub-threshold detections are dropped.
     detector_night_conf_threshold: float = 0.75
 
+    # Day window (wall hours, US/Mountain) used to classify a capture as
+    # day/night for the night gate AND the presence-baseline denominator
+    # (settled decision 4: "configured dark hours"). Everything outside
+    # [day_start_hour, day_end_hour) is night. Defaults mirror the historical
+    # 7-20 window.
+    day_start_hour: int = 7
+    day_end_hour: int = 20
+
     describer_model: str = "llama3.2-vision:latest"
     describer_ollama_host: str = "http://localhost:11434"
     describer_timeout: int = 180
@@ -51,16 +59,25 @@ class Config:
     # Entity identity (settled decisions 1 & 2). The re-id fingerprint is the
     # identity KEY; the describer VLM supplies make/model + lettering
     # attributes. Two crops are the same entity when their fingerprints match
-    # within ``reid_similarity_threshold`` (cosine).
-    reid_similarity_threshold: float = 0.85
-    reid_model: str = "cv2-silhouette-v1"
+    # within ``reid_similarity_threshold`` (normalized-L2 similarity, 1 - dist;
+    # lowered to 0.80 after the v2 descriptor separated lookalikes).
+    reid_similarity_threshold: float = 0.80
+    reid_model: str = "cv2-silhouette-v2"
 
     # Expected-presence baseline: per entity_id x direction, an entity is
     # "typically here" when it is present in >= this fraction of monitored
     # captures over the rolling window. Default >=50% over 7 days (settled
-    # decision 2), surfaced as config so it can be tuned.
+    # decision 2), surfaced as config so it can be tuned. The denominator
+    # counts DAY captures only (night captures inflate it without adding
+    # numerator, since the night confidence gate drops most night detections).
     entity_expected_presence_ratio: float = 0.5
     entity_baseline_window_days: float = 7.0
+
+    # Hysteresis: once an entity is "expected" it stays expected (no alert)
+    # until it has been absent >= this many days, so a familiar vehicle at
+    # ~threshold presence does not flip between alert/note on every minor miss
+    # (occlusion, weather). Default 2 days.
+    entity_expected_absence_days: float = 2.0
 
     # Location policy (settled decision 3). ``road`` = pass-by (note only, no
     # alert); ``driveway`` = identity-expectedness eval (unfamiliar -> alert).

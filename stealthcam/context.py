@@ -18,7 +18,9 @@ import pytz
 
 CAMERA_TZ = "US/Mountain"
 
-# The wall-hour window treated as "day". Everything else is night.
+# The wall-hour window treated as "day". Everything else is night. These are
+# the DEFAULTS; the worker/config can override them per settled decision 4
+# ("configured dark hours") via the `day_start_hour` / `day_end_hour` kwargs.
 DAY_START_HOUR = 7
 DAY_END_HOUR = 20  # exclusive
 
@@ -90,20 +92,23 @@ def parse_region_mapping(spec: str) -> dict[str, str]:
     return out
 
 
-def is_night(created_dt: str | None, now_wall: datetime | None = None) -> bool:
+def is_night(created_dt: str | None, now_wall: datetime | None = None,
+             day_start_hour: int = DAY_START_HOUR,
+             day_end_hour: int = DAY_END_HOUR) -> bool:
     """True when a capture timestamp falls in the configured dark hours.
 
     ``created_dt`` is the API's ``createdDateTime`` (naive UTC, or offset/Z
     suffixed). We convert to US/Mountain wall time and compare the hour against
-    the day window, matching ``dashboard._lighting``. ``now_wall`` lets a test
-    pin the wall clock.
+    the day window (``day_start_hour``..``day_end_hour``, configurable per
+    settled decision 4), matching ``dashboard._lighting``. ``now_wall`` lets a
+    test pin the wall clock.
     """
     if now_wall is not None:
-        return not (DAY_START_HOUR <= now_wall.hour < DAY_END_HOUR)
+        return not (day_start_hour <= now_wall.hour < day_end_hour)
     if not created_dt:
         return False
     dt = datetime.fromisoformat(created_dt)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=pytz.UTC)
     wall = dt.astimezone(pytz.timezone(CAMERA_TZ))
-    return not (DAY_START_HOUR <= wall.hour < DAY_END_HOUR)
+    return not (day_start_hour <= wall.hour < day_end_hour)
