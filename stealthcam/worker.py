@@ -256,12 +256,14 @@ def process_capture(capture: dict, client: StealthcamClient, detector: Detector,
 
 
 def backfill(cfg, client: StealthcamClient, detector: Detector, memory: Memory,
-             subimage_dir: Path, max_captures: int = 200) -> int:
+             subimage_dir: Path, max_captures: int = 200,
+             region_mapping: dict[str, str] | None = None,
+             force_seen: bool = False) -> int:
     """Seed the memory baseline from recent captures (no alerts, no dashboard).
 
     Pages back through images-list and processes captures in baseline mode so
     persistent objects (parked tractor/car) are already "static" before the
-    live loop starts. Returns the number of captures backfilled.
+    first live alert. Returns the number of captures backfilled.
 
     Captures are processed in CHRONOLOGICAL order (oldest first). The
     images-list endpoint returns newest-first, and static detection measures
@@ -272,8 +274,21 @@ def backfill(cfg, client: StealthcamClient, detector: Detector, memory: Memory,
     every capture (the parked-tractor bug). Sorting oldest-first makes the
     first sighting carry the earliest timestamp, so the span grows correctly
     and the object converges to static.
+
+    ``region_mapping`` must be the SAME direction->region mapping the live
+    loop uses: with compass-bearing directions and no mapping, every frame
+    resolves to an unclassified region, so neither record_monitored (denominator,
+    gated on driveway/road) nor entity resolution (driveway-only) runs and the
+    backfill seeds entities=0 — the P0-2 gate fails on the live DB.
+
+    ``force_seen`` reprocesses captures already in seen_guids. The pre-#36
+    worker marked every capture seen for weeks, so on a live database the
+    seen-set covers the entire backfill window and the default skip would
+    process 0 captures (entities=0). Baseline seeding must run over the
+    already-seen history; set force_seen=True for the pre-go-live backfill.
     """
-    log.info("backfill: seeding baseline (up to %d captures)", max_captures)
+    log.info("backfill: seeding baseline (up to %d captures%s)",
+             max_captures, ", force_seen" if force_seen else "")
     captures: list[dict] = []
     cursor = None
     while len(captures) < max_captures:
@@ -293,13 +308,14 @@ def backfill(cfg, client: StealthcamClient, detector: Detector, memory: Memory,
 
     processed = 0
     for capture in captures:
-        if memory.has_seen(capture["imageGuid"]):
+        if memory.has_seen(capture["imageGuid"]) and not force_seen:
             continue
         try:
             process_capture(capture, client, detector, None, memory, None, None,
                             subimage_dir, baseline_mode=True,
                             day_start_hour=getattr(cfg, "day_start_hour", 7),
-                            day_end_hour=getattr(cfg, "day_end_hour", 20))
+                            day_end_hour=getattr(cfg, "day_end_hour", 20),
+                            region_mapping=region_mapping)
             processed += 1
         except Exception as e:
             log.error("backfill capture %s failed: %s", capture["imageGuid"], e)
@@ -464,13 +480,22 @@ def main() -> None:
 
     # --backfill: seed the memory baseline, then exit (run before going live).
     if "--backfill" in sys.argv:
+        if not cfg.direction_regions.strip():
+            log.warning(
+                "backfill: direction_regions is EMPTY — every frame resolves "
+                "to an unclassified region, so no entities/presence will be "
+                "seeded (P0-2 gate: entities must be > 0). Set "
+                "STEALTHCAM_DIRECTION_REGIONS before going live."
+            )
         client = StealthcamClient(secrets_path=cfg.secrets_stealthcam)
         client.login()
         detector = Detector(cfg.detector_weights, cfg.detector_conf_threshold, cfg.detector_device)
         memory = _make_memory(cfg)
         subimage_dir = Path(cfg.subimage_dir)
         subimage_dir.mkdir(parents=True, exist_ok=True)
-        n = backfill(cfg, client, detector, memory, subimage_dir)
+        n = backfill(cfg, client, detector, memory, subimage_dir,
+                     region_mapping=parse_region_mapping(cfg.direction_regions),
+                     force_seen="--backfill-force-seen" in sys.argv)
         memory.close()
         log.info("backfill complete: %d captures", n)
         return
@@ -506,6 +531,13 @@ def main() -> None:
         return
 
     backoff = cfg.poll_interval_seconds
+    if not cfg.direction_regions.strip():
+        log.warning(
+            "live loop: direction_regions is EMPTY — vehicles in unclassified "
+            "regions fall back to the novel-vehicle policy (static -> suppress, "
+            "else alert) and the presence baseline will not run. Set "
+            "STEALTHCAM_DIRECTION_REGIONS to enable the driveway/road policy."
+        )
     while True:
         try:
             result = run_once(cfg)
