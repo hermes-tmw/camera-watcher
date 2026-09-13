@@ -22,12 +22,17 @@ with no cross-scope leakage:
 Run standalone (after copying the DB — never work on the live file without a
 staging pass first):
 
-    python3 -m stealthcam.migrate_scope /path/to/stealthcam.db \
+    python3 -m stealthcam.migrate /path/to/stealthcam.db \
         [--stamp taylor_hill] [--backup-dir DIR] [--dry-run]
 
 The Memory class calls ``migrate_scoped_db()`` at open, so a deployment that
-ships this code migrates on first use. A ``.pre-scope-migration.bak`` copy is
-taken once (first successful run) before any write.
+ships this code migrates on first use. That auto-migration path is wrapped by
+``migrate_db_open()``, which takes the same one-time ``.pre-scope-migration.bak``
+snapshot the CLI path takes before any write (deploy-path safety: the backup
+must not exist only on the manual path). Each table rebuild is additionally
+wrapped in one explicit transaction, so a crash mid-rebuild (SIGKILL, OOM,
+container restart) rolls back to the pre-rebuild state instead of stranding
+the table half-migrated.
 """
 from __future__ import annotations
 
@@ -40,6 +45,13 @@ from pathlib import Path
 # (not a bare constant sprinkled through the code) so the next location can
 # grep for every place a default stamp is applied.
 DEFAULT_STAMP = "taylor_hill"
+
+# Schema epoch stamped into ``PRAGMA user_version`` once a DB reaches the
+# scoped shape. Memory-open uses it as a fast path: an epoch match proves the
+# DB passed this module's checks, so it skips the per-boot sqlite_master
+# scan. BUMP THIS whenever the scoped schema or migration changes shape —
+# DBs stamped with an older epoch re-run the full check on next open.
+SCHEMA_EPOCH_USER_VERSION = 1
 
 # Tables that must be rebuilt with a scope column + composite PK. Each entry:
 # (table, pk-without-scope, all-columns-with-types, not-null-columns).
@@ -171,6 +183,33 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
+def assert_no_orphan_rebuild_tables(conn: sqlite3.Connection) -> None:
+    """Refuse to run over stranded ``*_legacy``/``*_new`` rebuild artifacts.
+
+    A crash during an OLD (pre-fix) migration run can leave ``<table>_legacy``
+    / ``<table>_new`` behind with the real ``<table>`` empty. Silently
+    "migrating" around that would strand the rows forever and hand the engine
+    an EMPTY table (silent data wipe). The DB is recoverable by hand from
+    those tables — make the operator do that loudly rather than guess.
+
+    Deliberately UNCONDITIONAL (runs on every Memory open, even on the
+    user_version fast path): it is a single sqlite_master query, and the
+    fast path must never skip the stranded-data guard.
+    """
+    orphans = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND (name LIKE '%_legacy' OR name LIKE '%_new')")]
+    if orphans:
+        raise RuntimeError(
+            f"stranded rebuild table(s) from an interrupted migration: "
+            f"{sorted(orphans)} — a previous migration crashed mid-rebuild; "
+            f"refusing to open. Recover by hand: for each affected table, "
+            f"copy rows from the _legacy/_new table back into the live one "
+            f"(from the .pre-scope-migration.bak snapshot if needed), drop "
+            f"the orphan tables, and retry. Do NOT delete the orphans "
+            f"blindly — they may hold the only copy of the rows.")
+
+
 def _create_scoped(conn: sqlite3.Connection, table: str, spec: dict,
                    default_scope: str) -> None:
     """Create the scoped version of `table`.
@@ -202,9 +241,20 @@ def migrate_scoped_db(conn: sqlite3.Connection,
     (created empty scoped tables).
 
     Idempotent. Additive: existing rows are preserved with scope=stamp.
-    Single connection/transaction per table rebuild; a failure mid-way
-    aborts before any commit (caller controls the final commit).
+
+    Crash safety: each table's rebuild (RENAME -> CREATE _new -> INSERT ->
+    DROP legacy -> RENAME back) runs inside ONE explicit BEGIN IMMEDIATE /
+    COMMIT transaction — SQLite DDL is transactional, so a process killed
+    mid-rebuild rolls back to the pre-rebuild state and the retry re-runs
+    that table cleanly. In Python sqlite3's legacy autocommit mode the DDL
+    would otherwise commit immediately, stranding the rebuild half-done.
+
+    The caller controls the outer transaction for the non-rebuild paths
+    (fresh-DB schema creation, index creation); those commit via the
+    caller's ``conn.commit()`` as before.
     """
+    assert_no_orphan_rebuild_tables(conn)
+
     report: dict = {"status": "already-scoped", "tables": {}}
     existing = {t for (t,) in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
@@ -239,22 +289,34 @@ def migrate_scoped_db(conn: sqlite3.Connection,
         ins_cols = ", ".join(["scope"] + cols)
         placeholders = ", ".join(["?"] * (len(cols) + 1))
 
-        conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
-        _create_scoped(conn, table, spec, stamp)
-        rows = conn.execute(
-            f"SELECT {sel_cols} FROM {table}_legacy").fetchall()
-        # Plain INSERT: the new PK only adds a constant (the stamp) to the old
-        # one, so a collision here means legacy data was already corrupt —
-        # fail loudly rather than silently drop rows.
-        conn.executemany(
-            f"INSERT INTO {table}_new ({ins_cols}) VALUES ({placeholders})",
-            [(stamp, *row) for row in rows],
-        )
+        # One explicit transaction per table rebuild: RENAME -> CREATE _new
+        # -> INSERT -> DROP legacy -> RENAME back -> index. SQLite DDL is
+        # transactional, so a crash anywhere in here rolls the whole table
+        # back to its pre-rebuild (legacy) state; the retry re-runs it.
+        # (executescript would COMMIT any open txn implicitly — individual
+        # execute() calls keep this atomic.)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
+            _create_scoped(conn, table, spec, stamp)
+            rows = conn.execute(
+                f"SELECT {sel_cols} FROM {table}_legacy").fetchall()
+            # Plain INSERT: the new PK only adds a constant (the stamp) to the
+            # old one, so a collision here means legacy data was already
+            # corrupt — fail loudly rather than silently drop rows.
+            conn.executemany(
+                f"INSERT INTO {table}_new ({ins_cols}) VALUES ({placeholders})",
+                [(stamp, *row) for row in rows],
+            )
+            conn.execute(f"DROP TABLE {table}_legacy")
+            conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+            if table in _SCOPE_INDEXES:
+                conn.execute(_SCOPE_INDEXES[table])
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
         report["tables"][table] = len(rows)
-        conn.execute(f"DROP TABLE {table}_legacy")
-        conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
-        if table in _SCOPE_INDEXES:
-            conn.execute(_SCOPE_INDEXES[table])
 
     # Tables that existed but were already scoped (mixed-shape guard).
     for table in scoped_targets:
@@ -285,6 +347,49 @@ def _snapshot(db_path: Path, target: Path) -> None:
         src.close()
 
 
+def _ensure_backup(db_path: Path, backup_dir: str | None = None) -> Path | None:
+    """Take the one-time pre-migration snapshot if it doesn't already exist.
+
+    Idempotent: re-runs never overwrite the original snapshot (the original
+    pre-migration bytes are the artifact — a second snapshot of an already
+    migrated DB would silently replace the rollback copy with migrated data).
+    Returns the backup path, or None when there is nothing to snapshot
+    (non-file-backed, or a zero-byte file — an empty DB has no data to roll
+    back; sqlite3.connect materializes a 0-byte file the moment Memory opens
+    a not-yet-existing path, so this is what a "fresh DB" looks like here).
+    """
+    if not db_path.is_file():
+        return None
+    if db_path.stat().st_size == 0:
+        return None
+    if backup_dir:
+        target = Path(backup_dir).resolve() / _backup_path(db_path).name
+    else:
+        target = _backup_path(db_path)
+    if not target.is_file():
+        _snapshot(db_path, target)
+    return target
+
+
+def migrate_db_open(db_path: str | Path, conn: sqlite3.Connection,
+                    stamp: str = DEFAULT_STAMP,
+                    backup_dir: str | None = None) -> dict:
+    """Migration entry point for the Memory-open (deploy auto-migration) path.
+
+    Takes the same one-time ``.pre-scope-migration.bak`` snapshot the CLI
+    path takes BEFORE migrating, then runs ``migrate_scoped_db``. The caller
+    owns the connection (Memory keeps using it) and commits as usual.
+
+    Backup is skipped when the DB file does not exist yet (Memory creating a
+    fresh DB — nothing pre-migration exists to roll back) or is ``:memory:``
+    (dies with the process anyway).
+    """
+    path = Path(db_path)
+    if str(path) != ":memory:":
+        _ensure_backup(path, backup_dir)
+    return migrate_scoped_db(conn, stamp=stamp)
+
+
 def migrate_file(db_path: str | Path, stamp: str = DEFAULT_STAMP,
                  backup_dir: str | None = None,
                  backup: bool = True) -> dict:
@@ -297,10 +402,7 @@ def migrate_file(db_path: str | Path, stamp: str = DEFAULT_STAMP,
     if not path.is_file():
         raise FileNotFoundError(f"no such database: {path}")
     if backup:
-        target = (Path(backup_dir).resolve() if backup_dir else path.parent) / \
-            _backup_path(path).name
-        if not target.is_file():
-            _snapshot(path, target)
+        _ensure_backup(path, backup_dir)
     conn = sqlite3.connect(str(path))
     try:
         report = migrate_scoped_db(conn, stamp=stamp)

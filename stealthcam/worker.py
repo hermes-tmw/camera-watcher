@@ -395,18 +395,29 @@ def _make_memory(cfg) -> Memory:
     """Build a Memory wired with the configured entity/re-id parameters.
 
     The Memory is bound to ``cfg.memory_scope`` (the location this process
-    serves) — scope is required, not inferred.
+    serves) — scope is required, not inferred. The entity/re-id params are
+    resolved per-scope (``scopes.<memory_scope>.<key>`` over the flat attr)
+    so a scope block can tune its site without touching others; reading the
+    flat attrs directly would silently ignore those overrides.
     """
     fingerprinter = OpenCVFingerprinter(
-        model=cfg.reid_model,
-        similarity_threshold=cfg.reid_similarity_threshold,
+        model=_scope_setting(cfg, cfg.memory_scope, "reid_model",
+                             "cv2-silhouette-v2"),
+        similarity_threshold=_scope_setting(
+            cfg, cfg.memory_scope, "reid_similarity_threshold", 0.80),
     )
     return Memory(cfg.pipeline_db, cfg.memory_iou_threshold,
                   cfg.memory_static_n_captures, cfg.memory_static_min_hours,
                   fingerprinter=fingerprinter,
-                  entity_expected_presence_ratio=cfg.entity_expected_presence_ratio,
-                  entity_baseline_window_days=cfg.entity_baseline_window_days,
-                  entity_expected_absence_days=cfg.entity_expected_absence_days,
+                  entity_expected_presence_ratio=_scope_setting(
+                      cfg, cfg.memory_scope,
+                      "entity_expected_presence_ratio", 0.5),
+                  entity_baseline_window_days=_scope_setting(
+                      cfg, cfg.memory_scope,
+                      "entity_baseline_window_days", 7.0),
+                  entity_expected_absence_days=_scope_setting(
+                      cfg, cfg.memory_scope,
+                      "entity_expected_absence_days", 2.0),
                   scope=cfg.memory_scope)
 
 
@@ -443,7 +454,10 @@ def run_once(cfg) -> dict:
     client.login()
 
     detector = Detector(cfg.detector_weights, cfg.detector_conf_threshold, cfg.detector_device)
-    describer = Describer(cfg.describer_model, cfg.describer_ollama_host, cfg.describer_timeout)
+    describer = Describer(
+        _scope_setting(cfg, cfg.memory_scope, "describer_model",
+                       "llama3.2-vision:latest"),
+        cfg.describer_ollama_host, cfg.describer_timeout)
     memory = _make_memory(cfg)
     notifier = Notifier(cfg.mattermost_base_url, cfg.mattermost_channel_id,
                         cfg.mattermost_bot, cfg.secrets_mattermost)
@@ -488,9 +502,13 @@ def run_once(cfg) -> dict:
                 s = process_capture(capture, client, detector, describer, memory,
                                     notifier, dashboard, subimage_dir,
                                     deferred_alert_threshold=cfg.deferred_alert_threshold,
-                                    night_conf_threshold=cfg.detector_night_conf_threshold,
-                                    day_start_hour=cfg.day_start_hour,
-                                    day_end_hour=cfg.day_end_hour,
+                                    night_conf_threshold=_scope_setting(
+                                        cfg, cfg.memory_scope,
+                                        "detector_night_conf_threshold", 0.75),
+                                    day_start_hour=_scope_setting(
+                                        cfg, cfg.memory_scope, "day_start_hour", 7),
+                                    day_end_hour=_scope_setting(
+                                        cfg, cfg.memory_scope, "day_end_hour", 20),
                                     region_mapping=region_mapping)
             except Exception as e:
                 # A deterministically-crashing capture must never wedge the
@@ -547,7 +565,10 @@ def main() -> None:
         client = StealthcamClient(secrets_path=cfg.secrets_stealthcam)
         client.login()
         detector = Detector(cfg.detector_weights, cfg.detector_conf_threshold, cfg.detector_device)
-        describer = Describer(cfg.describer_model, cfg.describer_ollama_host, cfg.describer_timeout)
+        describer = Describer(
+            _scope_setting(cfg, cfg.memory_scope, "describer_model",
+                           "llama3.2-vision:latest"),
+            cfg.describer_ollama_host, cfg.describer_timeout)
         memory = _make_memory(cfg)
         notifier = Notifier(cfg.mattermost_base_url, cfg.mattermost_channel_id,
                             cfg.mattermost_bot, cfg.secrets_mattermost)

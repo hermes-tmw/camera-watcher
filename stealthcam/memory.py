@@ -62,10 +62,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger("stealthcam.memory")
 
 # Alert decision outcomes
 ALERT = "alert"
@@ -262,11 +265,32 @@ class Memory:
         self._conn = sqlite3.connect(self.db_path)
         # Migrate BEFORE executing the schema: on a legacy DB the scoped
         # indexes in _SCHEMA reference a scope column the old tables don't
-        # have yet. migrate_scoped_db rebuilds legacy tables (armor defaults),
+        # have yet. migrate_db_open takes the one-time pre-migration backup
+        # (deploy path: the DB must not be mutated in place without a
+        # rollback copy), then rebuilds legacy tables (armor defaults),
         # creates a fresh DB's scoped schema, and no-ops on scoped DBs.
-        from .migrate import migrate_scoped_db
+        # Every per-table rebuild is one explicit transaction, so a crash
+        # mid-rebuild rolls back instead of stranding the table half-done.
+        from .migrate import (migrate_db_open, assert_no_orphan_rebuild_tables,
+                              SCHEMA_EPOCH_USER_VERSION)
 
-        migrate_scoped_db(self._conn)
+        # Fast path (P2): an already-scoped DB stamped with the current
+        # epoch skips re-scanning sqlite_master on every boot. The epoch is
+        # bumped whenever the scoped schema/migration changes shape; a DB
+        # stamped with a DIFFERENT epoch still gets the full check.
+        cur_epoch = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if cur_epoch != SCHEMA_EPOCH_USER_VERSION:
+            report = migrate_db_open(self.db_path, self._conn)
+            if report["status"] != "already-scoped":
+                log.info("pipeline DB migrated at open: %s (%d tables)",
+                         report["status"], len(report.get("tables", {})))
+            self._conn.execute(
+                f"PRAGMA user_version = {SCHEMA_EPOCH_USER_VERSION}")
+        else:
+            # Fast path still guards stranded rebuild artifacts (unconditional
+            # — a user_version-stamped DB can still be stranded by an old
+            # crash AFTER it was stamped, and the guard is one query).
+            assert_no_orphan_rebuild_tables(self._conn)
         self._conn.executescript(_SCHEMA)
         self._backfill_columns()
         self._conn.commit()

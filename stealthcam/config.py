@@ -225,12 +225,36 @@ def load_config(path: str | None = None) -> Config:
 
 
 def _apply(cfg: Config, data: dict) -> None:
+    # `scopes` is a nested {scope: {param: value}} map, NOT a flat attr —
+    # merge it into cfg.scopes so the whitelist validation in __post_init__
+    # runs on it. Flattening it (the generic path) would produce a
+    # nonexistent `scopes_<scope>_<param>` attr that the hasattr() filter
+    # silently drops: the override would never apply AND a typo'd param
+    # would never raise (P1: a Wichita site configured via YAML would
+    # silently run Taylor's flat config).
+    data = dict(data)
+    yaml_scopes = data.pop("scopes", None)
+    if yaml_scopes is not None:
+        if not isinstance(yaml_scopes, dict):
+            raise ValueError(
+                f"scopes must be a mapping of scope name -> params, got "
+                f"{type(yaml_scopes).__name__}")
+        merged = dict(cfg.scopes)
+        merged.update(yaml_scopes)
+        cfg.scopes = merged
     flat = _flatten(data)
     for key, val in flat.items():
+        # A literal dotted `scopes.<scope>...` key bypasses the pop above;
+        # refuse it rather than silently dropping it into a dead attr.
+        if key.startswith("scopes."):
+            raise ValueError(
+                f"{key!r}: write per-scope overrides as a nested YAML "
+                f"`scopes:` mapping ({{scope_name: {{param: value}}}}), "
+                f"not a dotted key")
         attr = key.replace(".", "_")
         if hasattr(cfg, attr):
             setattr(cfg, attr, val)
-    cfg.__post_init__()
+    cfg.__post_init__()  # re-validates the merged scopes whitelist
 
 
 def _flatten(d: dict, prefix: str = "") -> dict:

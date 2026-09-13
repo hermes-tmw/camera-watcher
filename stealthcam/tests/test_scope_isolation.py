@@ -14,19 +14,29 @@ identity, state, or config — enforced structurally, not by discipline:
    worker binary (INSERTs that omit scope) keeps writing into the right scope
    during the deploy window.
 4. Per-scope config: scope_setting() resolves scopes.<scope>.<key> over the
-   legacy flat attrs, and an unknown key in a scopes block raises at load.
+   legacy flat attrs, an unknown key in a scopes block raises at load, a YAML
+   `scopes:` block both applies and validates (typo -> raise), and scope
+   overrides actually reach the live path (run_once -> process_capture,
+   _make_memory -> Memory) rather than being silently dropped for flat attrs.
+5. Migration safety: the Memory-open auto-migration path takes the same
+   one-time backup as the CLI; a crash mid-rebuild is transactional (rolls
+   back) and stranded orphan tables from an older crash refuse to run loudly.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from stealthcam.memory import Memory, ALERT, NOTE
-from stealthcam.migrate import migrate_scoped_db, migrate_file, DEFAULT_STAMP
+from stealthcam.migrate import (migrate_scoped_db, migrate_file,
+                                DEFAULT_STAMP, SCHEMA_EPOCH_USER_VERSION)
 from stealthcam.config import Config, load_config, _validate_scopes
 
 
@@ -385,6 +395,556 @@ CREATE TABLE monitored_captures (direction TEXT NOT NULL, region TEXT, guid TEXT
         conn = sqlite3.connect(str(path))
         self.assertEqual(self._counts(conn), counts)
         conn.close()
+
+    def test_memory_open_migration_takes_backup(self):
+        # P0-1 regression: the deploy path is Memory-open auto-migration —
+        # it must take the same one-time .pre-scope-migration.bak snapshot
+        # the CLI path takes. Without it, a bad migration on the only
+        # production DB has no rollback copy.
+        path, _ = self._legacy_db()
+        mem = _mk(str(path), "taylor_hill")
+        mem.close()
+        bak = Path(str(path) + ".pre-scope-migration.bak")
+        self.assertTrue(bak.is_file(),
+                        "Memory-open auto-migration must leave a backup")
+        # The backup holds the PRE-migration (legacy) shape, not the
+        # migrated one — a snapshot of migrated data is not a rollback copy.
+        bak_conn = sqlite3.connect(str(bak))
+        legacy_cols = {r[1] for r in bak_conn.execute(
+            "PRAGMA table_info(seen_guids)")}
+        bak_conn.close()
+        self.assertNotIn("scope", legacy_cols,
+                         "backup must hold the pre-migration schema")
+        # Idempotent: a second open must NOT overwrite the original snapshot
+        # (the pre-migration bytes are the artifact).
+        mem2 = _mk(str(path), "taylor_hill")
+        mem2.close()
+        self.assertTrue(bak.is_file())
+        bak_conn = sqlite3.connect(str(bak))
+        self.assertNotIn(
+            "scope",
+            {r[1] for r in bak_conn.execute("PRAGMA table_info(seen_guids)")})
+        bak_conn.close()
+
+    def test_memory_open_fresh_db_no_backup_junk(self):
+        # A fresh DB (created by Memory) has no pre-migration data — no
+        # backup file should be created for it (nothing to roll back).
+        path = self.dir / "fresh-open.db"
+        Memory(str(path), fingerprinter=_TrivialFingerprinter(),
+               scope="wichita").close()
+        self.assertFalse(
+            Path(str(path) + ".pre-scope-migration.bak").is_file())
+
+
+class TestMigrationCrashSafety(unittest.TestCase):
+    """P0-2: a crash mid-rebuild must not strand data silently.
+
+    The per-table rebuild used to run in Python sqlite3's legacy autocommit
+    mode, where every DDL commits immediately — a SIGKILL between RENAME and
+    RENAME-back left ``<table>_legacy``/``<table>_new`` orphaned and the
+    retry path recreated ``<table>`` EMPTY (silent data wipe). Now the
+    rebuild is one explicit transaction (SQLite DDL is transactional), and
+    stranded orphan tables from any older crash make the next open REFUSE
+    loudly instead of skipping them.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _legacy_db(self) -> Path:
+        path = self.dir / "legacy.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript("""
+CREATE TABLE seen_guids (guid TEXT PRIMARY KEY, seen_at TEXT NOT NULL);
+CREATE TABLE entities (entity_id TEXT PRIMARY KEY, direction TEXT NOT NULL,
+    region TEXT, fingerprint BLOB NOT NULL, model TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+    capture_count INTEGER NOT NULL DEFAULT 1,
+    attributes TEXT NOT NULL DEFAULT '{}', expected INTEGER NOT NULL DEFAULT 0);
+""")
+        for i in range(500):
+            conn.execute("INSERT INTO seen_guids VALUES (?, ?)",
+                         (f"g{i}", _iso(_T0)))
+        for i in range(4):
+            conn.execute(
+                "INSERT INTO entities (entity_id, direction, fingerprint, "
+                "model, first_seen_at, last_seen_at) VALUES (?, 'East', ?, "
+                "'m', ?, ?)", (f"e{i}", f"fp{i}".encode(), _iso(_T0), _iso(_T0)))
+        conn.commit()
+        conn.close()
+        return path
+
+    def _table_shape(self, path: Path, table: str) -> tuple[list[str], int]:
+        conn = sqlite3.connect(str(path))
+        try:
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+            n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            return cols, n
+        finally:
+            conn.close()
+
+    def _orphan_names(self, path: Path) -> list[str]:
+        conn = sqlite3.connect(str(path))
+        try:
+            return [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND (name LIKE '%_legacy' OR name LIKE '%_new')")]
+        finally:
+            conn.close()
+
+    def _kill_mid_migration(self, path: Path) -> str:
+        """Run migrate_scoped_db in a child process and SIGKILL it once a
+        rebuild artifact table appears (real process death, Percy probe 6
+        shape). Returns the orphan names observed at kill time.
+
+        With the transactional rebuild the artifact tables are uncommitted
+        until the table's txn commits, so a ro-connection poll usually never
+        sees them — that is itself the guarantee (the crash window is
+        invisible). When the poll does catch one (e.g. a slow table commit
+        boundary), the kill lands mid-flight for real.
+        """
+        repo_root = Path(__file__).resolve().parents[2]
+        child = self.dir / "child.py"
+        child.write_text(
+            "import sys\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "import sqlite3\n"
+            "from stealthcam.migrate import migrate_scoped_db\n"
+            "conn = sqlite3.connect(sys.argv[1])\n"
+            "migrate_scoped_db(conn)\n"
+            "conn.commit()\n"
+            "print('COMPLETED')\n")
+        proc = subprocess.Popen(
+            [sys.executable, str(child), str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 30
+        orphans: list[str] = []
+        while time.time() < deadline:
+            try:
+                probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                                        timeout=0.3)
+                orphans = [r[0] for r in probe.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND (name LIKE '%_legacy' OR name LIKE '%_new')")]
+                probe.close()
+            except sqlite3.OperationalError:
+                pass  # locked — migration in flight, keep polling
+            if orphans:
+                proc.kill()  # SIGKILL mid-rebuild, no cleanup, no commit
+                break
+            if proc.poll() is not None:
+                break  # finished before we could catch the window
+            time.sleep(0.01)
+        proc.communicate(timeout=30)
+        return ",".join(orphans)
+
+    def test_sigkill_mid_rebuild_crash_safe_on_retry(self):
+        # The regression contract (Percy probe 6): kill the migrating process
+        # with a real SIGKILL at any point during the rebuild, then run the
+        # retry path (= Memory open). The retry must either restore the data
+        # or refuse loudly — NEVER silently recreate the table empty.
+        #
+        # Under the transactional rebuild the orphan artifact tables are
+        # uncommitted until each table's txn commits, so the ro-poll usually
+        # cannot catch a mid-rebuild window (that IS the fix: the dangerous
+        # window is invisible from outside). The pre-fix behavior would
+        # strand visible committed orphans here (probe_6 saw seen_guids_
+        # legacy/_new) and the retry would report success with the table
+        # EMPTY. Assert the invariant either way:
+        path = self._legacy_db()
+        killed_during = self._kill_mid_migration(path)
+        orphans = self._orphan_names(path)
+        if not killed_during:
+            # No committed orphans observed while the migration ran — with
+            # the OLD autocommit rebuild this poll saw them within ~ms.
+            self.assertEqual(
+                orphans, [],
+                "orphan tables committed outside any transaction are "
+                "visible to a concurrent reader — that is the pre-fix "
+                "stranding shape; the rebuild must be transactional")
+        # Retry = the deploy's own recovery: next boot opens Memory again.
+        mem = _mk(str(path), "taylor_hill")
+        try:
+            for i in range(500):
+                self.assertTrue(mem.has_seen(f"g{i}"),
+                                f"seen_guids g{i} lost after crash+retry")
+            conn = sqlite3.connect(str(path))
+            n_entities = conn.execute(
+                "SELECT COUNT(*) FROM entities").fetchone()[0]
+            conn.close()
+            self.assertEqual(n_entities, 4,
+                             "entities lost after crash+retry")
+        finally:
+            mem.close()
+        # No stranded orphans, no wiped tables, no silent anything.
+        self.assertEqual(self._orphan_names(path), [])
+
+    def test_stranded_orphan_tables_refuse_to_run(self):
+        # A DB stranded by an OLD (pre-fix) migration run — legacy/new
+        # artifacts present, live table empty — must make the next open
+        # RAISE, never silently "migrate" around the stranded rows.
+        path = self._legacy_db()
+        conn = sqlite3.connect(str(path))
+        # Reproduce the pre-fix stranding shape (what probe_6 produced):
+        conn.execute("ALTER TABLE seen_guids RENAME TO seen_guids_legacy")
+        conn.execute(
+            "CREATE TABLE seen_guids_new (scope TEXT NOT NULL, "
+            "guid TEXT NOT NULL, seen_at TEXT NOT NULL, "
+            "PRIMARY KEY (scope, guid))")
+        conn.commit()
+        conn.close()
+        with self.assertRaises(RuntimeError) as ctx:
+            _mk(str(path), "taylor_hill")
+        self.assertIn("seen_guids_legacy", str(ctx.exception))
+        # The stranded rows are still there for manual recovery — the
+        # refusal must not have destroyed them.
+        conn = sqlite3.connect(str(path))
+        n = conn.execute(
+            "SELECT COUNT(*) FROM seen_guids_legacy").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 500)
+
+    def test_stranded_orphans_refuse_even_on_epoch_fast_path(self):
+        # The user_version fast path must NOT skip the stranded-orphan guard:
+        # a DB stamped with the epoch can still be stranded by a later
+        # legacy-crash artifact planted on disk (or restored from a partial
+        # backup). The guard is unconditional.
+        path = self._legacy_db()
+        _mk(str(path), "taylor_hill").close()  # migrates + stamps epoch
+        conn = sqlite3.connect(str(path))
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            SCHEMA_EPOCH_USER_VERSION)
+        conn.execute("ALTER TABLE entities RENAME TO entities_legacy")
+        conn.execute(
+            "CREATE TABLE entities_new (scope TEXT NOT NULL)")
+        conn.commit()
+        conn.close()
+        with self.assertRaises(RuntimeError) as ctx:
+            _mk(str(path), "taylor_hill")
+        self.assertIn("entities_legacy", str(ctx.exception))
+
+    def test_orphan_check_in_migrate_scoped_db_too(self):
+        # The guard lives at the migrate_scoped_db level, so the CLI path
+        # (migrate_file) refuses stranded DBs as loudly as Memory-open.
+        path = self._legacy_db()
+        conn = sqlite3.connect(str(path))
+        conn.execute("ALTER TABLE seen_guids RENAME TO seen_guids_legacy")
+        conn.execute("CREATE TABLE seen_guids_new (scope TEXT NOT NULL)")
+        conn.commit()
+        with self.assertRaises(RuntimeError):
+            migrate_scoped_db(conn)
+        conn.close()
+
+    def test_migrated_epoch_fast_path_skips_rescan(self):
+        # P2: after a successful migration/open, the DB is stamped with the
+        # schema epoch and the NEXT open skips the sqlite_master scan.
+        path = self._legacy_db()
+        conn = sqlite3.connect(str(path))
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], 0)
+        conn.close()
+        mem = _mk(str(path), "taylor_hill")
+        mem.close()
+        conn = sqlite3.connect(str(path))
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            SCHEMA_EPOCH_USER_VERSION,
+            "Memory open must stamp the schema epoch")
+        conn.close()
+        # A fresh DB gets the epoch stamped too (same fast path).
+        fresh = self.dir / "fresh-epoch.db"
+        Memory(str(fresh), fingerprinter=_TrivialFingerprinter(),
+               scope="taylor_hill").close()
+        conn = sqlite3.connect(str(fresh))
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            SCHEMA_EPOCH_USER_VERSION)
+        conn.close()
+
+
+class TestYamlScopeConfig(unittest.TestCase):
+    """P1-1: YAML `scopes:` must apply AND validate (fail loudly on typos).
+
+    The flat-key path used to flatten `scopes.<scope>.<param>` into a
+    nonexistent `scopes_<scope>_<param>` attr that the hasattr() filter
+    silently dropped — the override never applied and a typo'd param never
+    raised, so a YAML-configured site silently ran another site's config.
+    """
+
+    def _load(self, yaml_text: str, env=None):
+        import os
+        from unittest import mock
+        d = tempfile.mkdtemp()
+        cfg_path = Path(d) / "config.yaml"
+        cfg_path.write_text(yaml_text)
+        with mock.patch.dict(os.environ, env or {}, clear=False):
+            cfg = load_config(str(cfg_path))
+        return cfg
+
+    def test_yaml_scopes_block_applies(self):
+        cfg = self._load(
+            "memory_scope: wichita\n"
+            "scopes:\n"
+            "  wichita:\n"
+            "    direction_regions: north=road,east=driveway\n"
+            "    entity_expected_presence_ratio: 0.6\n")
+        self.assertEqual(cfg.memory_scope, "wichita")
+        self.assertEqual(
+            cfg.scope_setting("wichita", "direction_regions", ""),
+            "north=road,east=driveway")
+        self.assertEqual(
+            cfg.scope_setting("wichita", "entity_expected_presence_ratio", 0.5),
+            0.6)
+        # Other scopes untouched by wichita's block.
+        self.assertEqual(
+            cfg.scope_setting("taylor_hill", "entity_expected_presence_ratio", 0.5),
+            0.5)
+
+    def test_yaml_scopes_typo_raises(self):
+        # A typo'd param in a YAML scopes block must fail at config load —
+        # not silently no-op until the first decision.
+        with self.assertRaises(ValueError) as ctx:
+            self._load(
+                "scopes:\n"
+                "  wichita:\n"
+                "    diretcion_regions: north=road\n")
+        self.assertIn("diretcion_regions", str(ctx.exception))
+
+    def test_yaml_scopes_non_mapping_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("scopes: not-a-mapping\n")
+
+    def test_yaml_dotted_scopes_key_refused(self):
+        # The literal flat form `scopes.wichita.direction_regions: ...` used
+        # to be silently dropped; it must now be refused (write the nested
+        # form), so no path drops a scopes config silently.
+        with self.assertRaises(ValueError) as ctx:
+            self._load("scopes.wichita.direction_regions: north=road\n")
+        self.assertIn("scopes.wichita", str(ctx.exception))
+
+    def test_env_scopes_and_yaml_scopes_merge(self):
+        # Both sources feed cfg.scopes; the env (compose-injected) wins on
+        # per-key conflicts since it is applied after the file.
+        import json
+        import os
+        from unittest import mock
+        d = tempfile.mkdtemp()
+        cfg_path = Path(d) / "config.yaml"
+        cfg_path.write_text(
+            "scopes:\n"
+            "  wichita:\n"
+            "    direction_regions: north=road\n"
+            "  taylor_hill:\n"
+            "    entity_expected_presence_ratio: 0.55\n")
+        env = {"STEALTHCAM_SCOPES": json.dumps(
+            {"wichita": {"direction_regions": "north=driveway"}})}
+        with mock.patch.dict(os.environ, env, clear=False):
+            cfg = load_config(str(cfg_path))
+        self.assertEqual(cfg.scopes["taylor_hill"]
+                         ["entity_expected_presence_ratio"], 0.55)
+        self.assertEqual(cfg.scopes["wichita"]["direction_regions"],
+                         "north=driveway")
+
+
+class TestScopeWiringLivePath(unittest.TestCase):
+    """P1-2: scope overrides must reach the LIVE path, not just scope_setting.
+
+    run_once used to pass night/day flat attrs to process_capture and
+    _make_memory read the five entity/re-id params flat — so a scope block
+    differing from the flat values was silently ignored. These tests assert
+    the values that actually ARRIVE at process_capture / Memory.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _cfg(self, scope_block: dict, flat_overrides: dict) -> Config:
+        cfg = Config()
+        cfg.scopes = {"taylor_hill": scope_block}
+        cfg.__post_init__()
+        for k, v in flat_overrides.items():
+            setattr(cfg, k, v)
+        cfg.memory_scope = "taylor_hill"
+        cfg.pipeline_db = str(Path(self.tmp.name) / "wiring.db")
+        return cfg
+
+    def test_make_memory_receives_scope_params(self):
+        from stealthcam.worker import _make_memory
+        cfg = self._cfg(
+            {"entity_expected_presence_ratio": 0.9,
+             "entity_baseline_window_days": 3.0,
+             "entity_expected_absence_days": 5.0,
+             "reid_similarity_threshold": 0.42,
+             "reid_model": "cv2-silhouette-v2"},
+            # Flat values deliberately DIFFERENT from the scope block.
+            {"entity_expected_presence_ratio": 0.5,
+             "entity_baseline_window_days": 7.0,
+             "entity_expected_absence_days": 2.0,
+             "reid_similarity_threshold": 0.55})
+        mem = _make_memory(cfg)
+        try:
+            self.assertEqual(mem.entity_expected_presence_ratio, 0.9)
+            self.assertEqual(mem.entity_baseline_window_days, 3.0)
+            self.assertEqual(mem.entity_expected_absence_days, 5.0)
+            self.assertEqual(mem.fingerprinter.similarity_threshold, 0.42)
+        finally:
+            mem.close()
+
+    def test_make_memory_flat_fallback_when_no_scope_block(self):
+        # No scope block -> flat attrs (the Taylor live shape) still win.
+        from stealthcam.worker import _make_memory
+        cfg = self._cfg({}, {"entity_expected_presence_ratio": 0.7})
+        mem = _make_memory(cfg)
+        try:
+            self.assertEqual(mem.entity_expected_presence_ratio, 0.7)
+        finally:
+            mem.close()
+
+    def test_run_once_passes_scope_params_to_process_capture(self):
+        # Behavior, not reflection: stub run_once's externals, record the
+        # kwargs process_capture actually receives (the Percy probe shape).
+        from stealthcam import worker
+        recorded = {}
+
+        def fake_process_capture(capture, client, detector, describer,
+                                 memory, notifier, dashboard, subimage_dir,
+                                 **kw):
+            recorded.update(kw)
+            return {"alerts": 0, "flags": 0, "suppressed": 0, "detections": 0}
+
+        class _Stub:
+            def __init__(self, *a, **k):
+                pass
+
+            def login(self):
+                pass
+
+            def list_images(self, take_count=None):
+                return [{"imageGuid": "fake-guid-1"}]
+
+            def get_device_status(self):
+                return {}
+
+            def close(self):
+                pass
+
+        class _RecMemory:
+            """Records the wiring that reaches has_seen/mark_seen."""
+            def has_seen(self, guid):
+                return False
+
+            def mark_seen(self, guid):
+                pass
+
+            def close(self):
+                pass
+
+        stubs = {
+            "StealthcamClient": _Stub,
+            "Detector": _Stub,
+            "Describer": _Stub,
+            "Notifier": _Stub,
+            "DashboardWriter": _Stub,
+            "process_capture": fake_process_capture,
+            "_make_memory": lambda cfg: _RecMemory(),
+        }
+        saved = {k: getattr(worker, k) for k in stubs}
+        for k, v in stubs.items():
+            setattr(worker, k, v)
+        try:
+            cfg = self._cfg(
+                {"detector_night_conf_threshold": 0.9,
+                 "day_start_hour": 6,
+                 "day_end_hour": 21,
+                 "direction_regions": "west=driveway"},
+                {"detector_night_conf_threshold": 0.75,
+                 "day_start_hour": 7,
+                 "day_end_hour": 20,
+                 "direction_regions": "south=road",
+                 "dashboard_db_url": ""})
+            cfg.subimage_dir = str(Path(self.tmp.name))
+            worker.run_once(cfg)
+        finally:
+            for k, v in saved.items():
+                setattr(worker, k, v)
+        # The SCOPE values must be what reached process_capture — flat
+        # values arriving here is exactly the P1-2 bug.
+        self.assertEqual(recorded.get("night_conf_threshold"), 0.9)
+        self.assertEqual(recorded.get("day_start_hour"), 6)
+        self.assertEqual(recorded.get("day_end_hour"), 21)
+        self.assertEqual(recorded.get("region_mapping"),
+                         {"west": "driveway"})
+
+    def test_run_once_flat_fallback_without_scope_block(self):
+        # No scope block -> flat attrs reach process_capture unchanged.
+        from stealthcam import worker
+        recorded = {}
+
+        def fake_process_capture(capture, client, detector, describer,
+                                 memory, notifier, dashboard, subimage_dir,
+                                 **kw):
+            recorded.update(kw)
+            return {"alerts": 0, "flags": 0, "suppressed": 0, "detections": 0}
+
+        class _Stub:
+            def __init__(self, *a, **k):
+                pass
+
+            def login(self):
+                pass
+
+            def list_images(self, take_count=None):
+                return [{"imageGuid": "fake-guid-1"}]
+
+            def get_device_status(self):
+                return {}
+
+            def close(self):
+                pass
+
+        class _RecMemory:
+            def has_seen(self, guid):
+                return False
+
+            def mark_seen(self, guid):
+                pass
+
+            def close(self):
+                pass
+
+        stubs = {
+            "StealthcamClient": _Stub,
+            "Detector": _Stub,
+            "Describer": _Stub,
+            "Notifier": _Stub,
+            "DashboardWriter": _Stub,
+            "process_capture": fake_process_capture,
+            "_make_memory": lambda cfg: _RecMemory(),
+        }
+        saved = {k: getattr(worker, k) for k in stubs}
+        for k, v in stubs.items():
+            setattr(worker, k, v)
+        try:
+            cfg = self._cfg({}, {"detector_night_conf_threshold": 0.77,
+                                 "day_start_hour": 5,
+                                 "day_end_hour": 22,
+                                 "dashboard_db_url": ""})
+            cfg.subimage_dir = str(Path(self.tmp.name))
+            worker.run_once(cfg)
+        finally:
+            for k, v in saved.items():
+                setattr(worker, k, v)
+        self.assertEqual(recorded.get("night_conf_threshold"), 0.77)
+        self.assertEqual(recorded.get("day_start_hour"), 5)
+        self.assertEqual(recorded.get("day_end_hour"), 22)
 
 
 class TestScopeConfig(unittest.TestCase):
