@@ -105,7 +105,8 @@ class TestBackfillSeedingOnLiveDb(unittest.TestCase):
     def _memory(self):
         return Memory(":memory:", fingerprinter=OpenCVFingerprinter(),
                       entity_expected_presence_ratio=0.5,
-                      entity_baseline_window_days=7.0)
+                      entity_baseline_window_days=7.0,
+                      scope="taylor_hill")
 
     def _seed_seen(self, mem: Memory, n: int):
         """Pre-mark captures seen, as the pre-#36 worker did for weeks."""

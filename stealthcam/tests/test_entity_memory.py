@@ -59,10 +59,11 @@ def _attrs(make="", model="", lettering="", uncertain=True) -> VehicleAttributes
                              uncertain=uncertain)
 
 
-def _mk_memory():
+def _mk_memory(scope: str = "taylor_hill"):
     return Memory(":memory:", fingerprinter=_TrivialFingerprinter(),
                   entity_expected_presence_ratio=0.5,
-                  entity_baseline_window_days=7.0)
+                  entity_baseline_window_days=7.0,
+                  scope=scope)
 
 
 class TestEntityIdentity(unittest.TestCase):
@@ -215,7 +216,7 @@ class TestNightGate(unittest.TestCase):
 
         def run(created):
             det = _RecDetector()
-            mem = Memory(":memory:")
+            mem = Memory(":memory:", scope="taylor_hill")
             capture = {"imageGuid": str(uuid.uuid4()),
                        "imageDirections": ["East"] * 6,
                        "createdDateTime": created}
@@ -375,7 +376,8 @@ class TestExpectedHysteresis(unittest.TestCase):
         # lapses (absent >= 2 days) AND the ratio check alerts.
         m = Memory(":memory:", fingerprinter=_TrivialFingerprinter(),
                    entity_expected_presence_ratio=0.5,
-                   entity_baseline_window_days=1.0)
+                   entity_baseline_window_days=1.0,
+                   scope="taylor_hill")
         bbox = (100.0, 100.0, 300.0, 300.0)
         t0 = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
         for k in range(8):
