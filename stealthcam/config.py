@@ -6,6 +6,7 @@ live in ~/.hermes/secrets/ and are referenced by path.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,6 +16,21 @@ import yaml
 DEFAULT_CONFIG = "config.yaml"
 LOCAL_CONFIG = "config.local.yaml"
 PLACEHOLDER_PASSWORD = "***"
+
+
+def _validate_scopes(scopes: dict, valid_keys: tuple[str, ...]) -> None:
+    """Whitelist-check scope blocks eagerly (config load must fail loudly on a
+    typo'd param, not silently ignore it at the first decision)."""
+    for scope_name, params in (scopes or {}).items():
+        if not isinstance(params, dict):
+            raise ValueError(
+                f"scopes.{scope_name} must be a mapping of param -> value, "
+                f"got {type(params).__name__}")
+        bad = set(params) - set(valid_keys)
+        if bad:
+            raise ValueError(
+                f"scopes.{scope_name} has unknown param(s) {sorted(bad)}; "
+                f"valid params: {sorted(valid_keys)}")
 
 
 @dataclass
@@ -97,6 +113,22 @@ class Config:
     dashboard_base_static_url: str = "http://mira.local"
     dashboard_local_data_dir: str = "/data/video/watcher"
 
+    # Per-location scope (2026-09-13 refactor): which location this process
+    # serves. The Memory engine keys every table row on this scope, so two
+    # sites sharing one DB never leak identity/state across each other.
+    # Default = taylor_hill: the ONLY live scope on the pipeline DB as of the
+    # refactor, so the existing deploy needs zero config change.
+    memory_scope: str = "taylor_hill"
+
+    # Per-scope parameter overrides: {scope_name: {param: value}}. Params not
+    # listed fall back to the legacy flat attrs above (direction_regions,
+    # detector_night_conf_threshold, day_start_hour/day_end_hour,
+    # entity_expected_presence_ratio, entity_baseline_window_days,
+    # entity_expected_absence_days, reid_similarity_threshold, reid_model,
+    # describer_model). Load from YAML `scopes:` or STEALTHCAM_SCOPES (JSON).
+    # Use scope_setting(scope, key) rather than reading either layer directly.
+    scopes: dict = field(default_factory=dict)
+
     poll_interval_seconds: int = 60
     poll_backoff_base: float = 2.0
     poll_backoff_max: int = 300
@@ -105,9 +137,45 @@ class Config:
     deferred_alert_threshold: int = 3
     requeue_older_than_hours: float = 24.0
 
+    # Keys that may be overridden per scope (whitelist — a typo'd key in a
+    # scopes block must raise, not silently do nothing).
+    SCOPE_KEYS = (
+        "direction_regions",
+        "detector_night_conf_threshold",
+        "day_start_hour",
+        "day_end_hour",
+        "entity_expected_presence_ratio",
+        "entity_baseline_window_days",
+        "entity_expected_absence_days",
+        "reid_similarity_threshold",
+        "reid_model",
+        "describer_model",
+    )
+
     def __post_init__(self):
         self.secrets_stealthcam = os.path.expanduser(self.secrets_stealthcam)
         self.secrets_mattermost = os.path.expanduser(self.secrets_mattermost)
+        # Whitelist-check every scope block eagerly so a bogus param fails at
+        # config load, not at the first decision. (load_config re-validates
+        # after merging STEALTHCAM_SCOPES into self.scopes.)
+        if self.scopes and not isinstance(self.scopes, dict):
+            raise ValueError(
+                f"scopes must be a mapping of scope name -> params, got "
+                f"{type(self.scopes).__name__}")
+        _validate_scopes(self.scopes, self.SCOPE_KEYS)
+
+    def scope_setting(self, scope: str, key: str, default=None):
+        """Per-scope config lookup: scopes.<scope>.<key> -> flat attr <key> -> default.
+
+        The flat-attr fallback is what keeps the existing Taylor Hill deploy
+        byte-identical: its settings arrive as legacy env/flat keys and apply
+        to its scope unchanged, while a new scope (e.g. wichita) overrides any
+        SCOPE_KEYS param in its own block without touching other scopes.
+        """
+        params = (self.scopes or {}).get(scope)
+        if params and key in params:
+            return params[key]
+        return getattr(self, key, default)
 
 
 def load_config(path: str | None = None) -> Config:
@@ -125,6 +193,22 @@ def load_config(path: str | None = None) -> Config:
         _apply(cfg, data)
     # Environment overrides (STEALTHCAM_<FLAT_KEY>) take precedence over the file.
     _apply_env(cfg)
+    # STEALTHCAM_SCOPES: JSON map {scope: {param: value}} for per-scope
+    # overrides (compose can inject them without a config file).
+    env_scopes = os.environ.get("STEALTHCAM_SCOPES", "").strip()
+    if env_scopes:
+        try:
+            parsed = json.loads(env_scopes)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"STEALTHCAM_SCOPES is not valid JSON: {e}; value was "
+                f"{env_scopes[:200]!r}") from e
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"STEALTHCAM_SCOPES must be a JSON object mapping scope name "
+                f"-> params, got {type(parsed).__name__}")
+        cfg.scopes.update(parsed)
+        _validate_scopes(cfg.scopes, cfg.SCOPE_KEYS)
     # In the camera-watcher compose stack, derive the dashboard DB URL from the
     # mounted watcher.cfg (gitignored) when no real URL was configured (empty or
     # still the `***` placeholder).
@@ -201,6 +285,10 @@ def _apply_env(cfg: Config) -> None:
         if not env.startswith("STEALTHCAM_"):
             continue
         key = env[len("STEALTHCAM_"):].lower()
+        # STEALTHCAM_SCOPES is parsed as JSON by load_config (it is a nested
+        # {scope: params} map, not a flat string attr) — never setattr it raw.
+        if key == "scopes":
+            continue
         # flat key uses dots (dashboard.db_url); attr uses underscores.
         attr = key.replace(".", "_")
         if hasattr(cfg, attr):

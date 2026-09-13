@@ -48,6 +48,15 @@ Decision rules:
 
 The store is a SQLite DB owned by the pipeline (single-writer). It also holds
 the seen_guids dedup set and the decisions/feedback tables (feedback-loop data).
+
+Per-location scope (2026-09-13 refactor): the engine is location-agnostic. One
+codebase + one DB serve multiple sites (Taylor Hill Stealthcam, Wichita house,
+...); every memory table carries a ``scope`` column and every composite PK
+includes it, so identity/state/config can never leak across sites. A Memory
+instance is bound to ONE scope at construction (``Memory(..., scope=...)`` —
+required, no default) and all of its reads/writes are scope-filtered. Identity
+hashing salts the scope into the entity_id, so byte-identical fingerprints in
+two scopes are distinct entities by construction.
 """
 from __future__ import annotations
 
@@ -68,12 +77,15 @@ NOTE = "note"
 TAG_TRAFFIC = "traffic"
 TAG_BACKGROUND = "background"
 
-_SCHEMA = """
+_MEMORY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen_guids (
-    guid TEXT PRIMARY KEY,
-    seen_at TEXT NOT NULL
+    scope TEXT NOT NULL,
+    guid TEXT NOT NULL,
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY (scope, guid)
 );
 CREATE TABLE IF NOT EXISTS memory_observations (
+    scope TEXT NOT NULL,
     id INTEGER PRIMARY KEY,
     direction TEXT NOT NULL,
     bbox TEXT NOT NULL,
@@ -83,6 +95,7 @@ CREATE TABLE IF NOT EXISTS memory_observations (
     classes_seen TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS decisions (
+    scope TEXT NOT NULL,
     id INTEGER PRIMARY KEY,
     guid TEXT NOT NULL,
     subimage INTEGER NOT NULL,
@@ -96,6 +109,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     decided_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS feedback (
+    scope TEXT NOT NULL,
     id INTEGER PRIMARY KEY,
     decision_id INTEGER,
     guid TEXT NOT NULL,
@@ -104,15 +118,21 @@ CREATE TABLE IF NOT EXISTS feedback (
     flagged_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS deferred_captures (
-    guid TEXT PRIMARY KEY,
+    scope TEXT NOT NULL,
+    guid TEXT NOT NULL,
     deferral_count INTEGER NOT NULL DEFAULT 1,
     alerted INTEGER NOT NULL DEFAULT 0,
     first_deferred_at TEXT NOT NULL,
-    last_deferred_at TEXT NOT NULL
+    last_deferred_at TEXT NOT NULL,
+    PRIMARY KEY (scope, guid)
 );
 -- Entity identity + expected-presence baseline (2026-09-13).
+-- entity_id is salted with the scope (see _new_entity_id): byte-identical
+-- fingerprints in two scopes hash to different ids, so no cross-scope
+-- collision or surfacing is possible even before the PK is consulted.
 CREATE TABLE IF NOT EXISTS entities (
-    entity_id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
     direction TEXT NOT NULL,
     region TEXT,
     fingerprint BLOB NOT NULL,
@@ -121,26 +141,45 @@ CREATE TABLE IF NOT EXISTS entities (
     last_seen_at TEXT NOT NULL,
     capture_count INTEGER NOT NULL DEFAULT 1,
     attributes TEXT NOT NULL DEFAULT '{}',
-    expected INTEGER NOT NULL DEFAULT 0
+    expected INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (scope, entity_id)
 );
 CREATE TABLE IF NOT EXISTS entity_presence (
+    scope TEXT NOT NULL,
     entity_id TEXT NOT NULL,
     direction TEXT NOT NULL,
     guid TEXT NOT NULL,
     captured_at TEXT NOT NULL,
     ts REAL NOT NULL,
-    PRIMARY KEY (entity_id, direction, guid)
+    PRIMARY KEY (scope, entity_id, direction, guid)
 );
 CREATE TABLE IF NOT EXISTS monitored_captures (
+    scope TEXT NOT NULL,
     direction TEXT NOT NULL,
     region TEXT,
     guid TEXT NOT NULL,
     captured_at TEXT NOT NULL,
     ts REAL NOT NULL,
     is_day INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (direction, guid)
+    PRIMARY KEY (scope, direction, guid)
 );
+CREATE INDEX IF NOT EXISTS idx_decisions_scope_guid
+    ON decisions (scope, guid);
+CREATE INDEX IF NOT EXISTS idx_entity_presence_scope_ts
+    ON entity_presence (scope, entity_id, direction, ts);
+CREATE INDEX IF NOT EXISTS idx_monitored_scope_ts
+    ON monitored_captures (scope, ts, is_day);
+CREATE INDEX IF NOT EXISTS idx_memory_obs_scope_dir
+    ON memory_observations (scope, direction);
 """
+
+# Rebuilt-by-migration tables carry ``DEFAULT 'taylor_hill'`` on scope so the
+# OLD worker binary (INSERTs without scope) can keep writing during the deploy
+# cutover window; fresh tables above have NO default (loud on omission).
+# migrate.py owns the difference; Memory just executes the schema.
+MEMORY_SCHEMA = _MEMORY_SCHEMA
+
+_SCHEMA = _MEMORY_SCHEMA
 
 
 def _now() -> str:
@@ -201,8 +240,15 @@ class Memory:
                  fingerprinter=None,
                  entity_expected_presence_ratio: float = 0.5,
                  entity_baseline_window_days: float = 7.0,
-                 entity_expected_absence_days: float = 2.0):
+                 entity_expected_absence_days: float = 2.0,
+                 scope: str | None = None):
+        if not scope:
+            raise ValueError(
+                "Memory requires an explicit scope (location name, e.g. "
+                "'taylor_hill') — a scopeless Memory would blur identity "
+                "state across sites; pass scope= from the caller's config.")
         self.db_path = str(db_path)
+        self.scope = scope
         self.iou_threshold = iou_threshold
         self.static_n_captures = static_n_captures
         self.static_min_hours = static_min_hours
@@ -214,15 +260,24 @@ class Memory:
             fingerprinter = OpenCVFingerprinter()
         self.fingerprinter = fingerprinter
         self._conn = sqlite3.connect(self.db_path)
+        # Migrate BEFORE executing the schema: on a legacy DB the scoped
+        # indexes in _SCHEMA reference a scope column the old tables don't
+        # have yet. migrate_scoped_db rebuilds legacy tables (armor defaults),
+        # creates a fresh DB's scoped schema, and no-ops on scoped DBs.
+        from .migrate import migrate_scoped_db
+
+        migrate_scoped_db(self._conn)
         self._conn.executescript(_SCHEMA)
-        self._migrate()
+        self._backfill_columns()
         self._conn.commit()
 
-    def _migrate(self) -> None:
-        """Additive schema migrations for pre-existing databases.
+    def _backfill_columns(self) -> None:
+        """Column additions for tables that predate a column (idempotent).
 
         ``CREATE TABLE IF NOT EXISTS`` does not add columns to a table that
         already exists, so column additions are applied here idempotently.
+        Legacy (pre-scope) tables are rebuilt with the scope dimension by
+        migrate.migrate_scoped_db (called from __init__ before this).
         """
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(entities)")}
         if "expected" not in cols:
@@ -238,18 +293,22 @@ class Memory:
     # -- dedup ---------------------------------------------------------------
 
     def has_seen(self, guid: str) -> bool:
-        cur = self._conn.execute("SELECT 1 FROM seen_guids WHERE guid = ?", (guid,))
+        cur = self._conn.execute(
+            "SELECT 1 FROM seen_guids WHERE scope = ? AND guid = ?",
+            (self.scope, guid))
         return cur.fetchone() is not None
 
     def mark_seen(self, guid: str) -> None:
         self._conn.execute(
-            "INSERT OR IGNORE INTO seen_guids (guid, seen_at) VALUES (?, ?)",
-            (guid, _now()),
+            "INSERT OR IGNORE INTO seen_guids (scope, guid, seen_at) VALUES (?, ?, ?)",
+            (self.scope, guid, _now()),
         )
         # A capture that was previously deferred is now successfully seen —
         # drop its deferral row so it no longer counts toward the alert
         # threshold or the requeue backfill.
-        self._conn.execute("DELETE FROM deferred_captures WHERE guid = ?", (guid,))
+        self._conn.execute(
+            "DELETE FROM deferred_captures WHERE scope = ? AND guid = ?",
+            (self.scope, guid))
         self._conn.commit()
 
     # -- deferred captures ---------------------------------------------------
@@ -263,49 +322,57 @@ class Memory:
         """
         now = _now()
         cur = self._conn.execute(
-            "SELECT deferral_count FROM deferred_captures WHERE guid = ?", (guid,)
+            "SELECT deferral_count FROM deferred_captures "
+            "WHERE scope = ? AND guid = ?", (self.scope, guid)
         )
         row = cur.fetchone()
         if row is None:
             self._conn.execute(
                 "INSERT INTO deferred_captures "
-                "(guid, deferral_count, alerted, first_deferred_at, last_deferred_at) "
-                "VALUES (?, 1, 0, ?, ?)",
-                (guid, now, now),
+                "(scope, guid, deferral_count, alerted, first_deferred_at, last_deferred_at) "
+                "VALUES (?, ?, 1, 0, ?, ?)",
+                (self.scope, guid, now, now),
             )
             count = 1
         else:
             count = row[0] + 1
             self._conn.execute(
                 "UPDATE deferred_captures SET deferral_count = ?, last_deferred_at = ? "
-                "WHERE guid = ?",
-                (count, now, guid),
+                "WHERE scope = ? AND guid = ?",
+                (count, now, self.scope, guid),
             )
         self._conn.commit()
         return count
 
     def is_deferred_alerted(self, guid: str) -> bool:
         cur = self._conn.execute(
-            "SELECT alerted FROM deferred_captures WHERE guid = ?", (guid,)
+            "SELECT alerted FROM deferred_captures WHERE scope = ? AND guid = ?",
+            (self.scope, guid)
         )
         row = cur.fetchone()
         return bool(row and row[0])
 
     def mark_deferred_alerted(self, guid: str) -> None:
         self._conn.execute(
-            "UPDATE deferred_captures SET alerted = 1 WHERE guid = ?", (guid,)
+            "UPDATE deferred_captures SET alerted = 1 "
+            "WHERE scope = ? AND guid = ?",
+            (self.scope, guid)
         )
         self._conn.commit()
 
     def clear_deferral(self, guid: str) -> None:
         """Drop a capture's deferral row once it has been successfully seen."""
-        self._conn.execute("DELETE FROM deferred_captures WHERE guid = ?", (guid,))
+        self._conn.execute(
+            "DELETE FROM deferred_captures WHERE scope = ? AND guid = ?",
+            (self.scope, guid))
         self._conn.commit()
 
     def deferred_guids(self) -> list[str]:
         """Return the guids currently tracked as deferred (never marked seen)."""
         rows = self._conn.execute(
-            "SELECT guid FROM deferred_captures ORDER BY last_deferred_at"
+            "SELECT guid FROM deferred_captures WHERE scope = ? "
+            "ORDER BY last_deferred_at",
+            (self.scope,),
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -313,11 +380,12 @@ class Memory:
 
     def _find_match(self, direction: str, bbox: tuple[float, float, float, float]):
         """Return the best-matching observation row (id, first_seen_at, count,
-        classes_seen, bbox) in this direction with IoU >= threshold, else None."""
+        classes_seen, bbox) in this scope+direction with IoU >= threshold,
+        else None."""
         rows = self._conn.execute(
             "SELECT id, first_seen_at, capture_count, classes_seen, bbox "
-            "FROM memory_observations WHERE direction = ?",
-            (direction,),
+            "FROM memory_observations WHERE scope = ? AND direction = ?",
+            (self.scope, direction),
         ).fetchall()
         best = None
         best_iou = 0.0
@@ -334,13 +402,13 @@ class Memory:
     # -- entity identity -----------------------------------------------------
 
     def _match_entity(self, direction: str, fingerprint: bytes) -> str | None:
-        """Return the entity_id of a same-model entity in `direction` whose
-        stored fingerprint matches `fingerprint`, else None."""
+        """Return the entity_id of a same-model entity in this scope's
+        `direction` whose stored fingerprint matches `fingerprint`, else None."""
         model = getattr(self.fingerprinter, "model", "")
         rows = self._conn.execute(
             "SELECT entity_id, fingerprint FROM entities "
-            "WHERE direction = ? AND model = ?",
-            (direction, model),
+            "WHERE scope = ? AND direction = ? AND model = ?",
+            (self.scope, direction, model),
         ).fetchall()
         for entity_id, stored in rows:
             if self.fingerprinter.matches(fingerprint, stored):
@@ -348,24 +416,28 @@ class Memory:
         return None
 
     def _new_entity_id(self, direction: str, fingerprint: bytes) -> str:
-        # Salt the hash with direction so a byte-identical fingerprint in two
-        # mapped directions does NOT collide on the global `entity_id` PK
-        # (entity matching is direction-scoped, so a same-bytes crop arriving
-        # in a second direction would otherwise INSERT the same hash and raise
-        # sqlite3.IntegrityError out of decide()).
+        # Salt the hash with SCOPE and direction so a byte-identical
+        # fingerprint never collides across scopes (Tom's core guarantee:
+        # Taylor Hill and Wichita identity can never leak) nor across mapped
+        # directions (entity matching is direction-scoped; a same-bytes crop
+        # arriving in a second direction would otherwise INSERT the same hash
+        # and raise sqlite3.IntegrityError out of decide()).
         digest = hashlib.sha256(
-            direction.encode("utf-8") + b"|" + fingerprint
+            self.scope.encode("utf-8") + b"|"
+            + direction.encode("utf-8") + b"|" + fingerprint
         ).hexdigest()[:16]
         return f"e-{digest}"
 
     def _resolve_entity(self, direction: str, fingerprint: bytes,
                         attributes_text: str, attributes_json: str,
                         now: str) -> tuple[str, bool]:
-        """Return (entity_id, created) for a fingerprint in `direction`.
+        """Return (entity_id, created) for a fingerprint in this scope's
+        `direction`.
 
         Matches an existing entity by fingerprint similarity (same model); if
-        none, creates a new entity keyed on the fingerprint hash. Updates the
-        entity's last_seen_at / capture_count / attributes on every sighting.
+        none, creates a new entity keyed on the scope-salted fingerprint hash.
+        Updates the entity's last_seen_at / capture_count / attributes on
+        every sighting.
         """
         model = getattr(self.fingerprinter, "model", "")
         entity_id = self._match_entity(direction, fingerprint)
@@ -374,16 +446,17 @@ class Memory:
             entity_id = self._new_entity_id(direction, fingerprint)
             created = True
             self._conn.execute(
-                "INSERT INTO entities (entity_id, direction, fingerprint, model, "
+                "INSERT INTO entities (scope, entity_id, direction, fingerprint, model, "
                 "first_seen_at, last_seen_at, capture_count, attributes) "
-                "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
-                (entity_id, direction, fingerprint, model, now, now, attributes_json),
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                (self.scope, entity_id, direction, fingerprint, model, now, now,
+                 attributes_json),
             )
         else:
             self._conn.execute(
                 "UPDATE entities SET last_seen_at = ?, capture_count = capture_count + 1 "
-                "WHERE entity_id = ?",
-                (now, entity_id),
+                "WHERE scope = ? AND entity_id = ?",
+                (now, self.scope, entity_id),
             )
             # Enrich attributes when new info appears (never overwrite a known
             # make/model with a blank one).
@@ -393,7 +466,8 @@ class Memory:
 
     def _merge_attributes(self, entity_id: str, attributes_json: str) -> None:
         cur = self._conn.execute(
-            "SELECT attributes FROM entities WHERE entity_id = ?", (entity_id,)
+            "SELECT attributes FROM entities WHERE scope = ? AND entity_id = ?",
+            (self.scope, entity_id)
         )
         row = cur.fetchone()
         if row is None:
@@ -412,18 +486,19 @@ class Memory:
         # Once confident, stay confident unless the new sighting is explicit.
         merged["uncertain"] = incoming.get("uncertain", existing.get("uncertain", True))
         self._conn.execute(
-            "UPDATE entities SET attributes = ? WHERE entity_id = ?",
-            (json.dumps(merged), entity_id),
+            "UPDATE entities SET attributes = ? WHERE scope = ? AND entity_id = ?",
+            (json.dumps(merged), self.scope, entity_id),
         )
 
     def record_presence(self, entity_id: str, direction: str, guid: str,
                         captured_at: str) -> None:
-        """Record that `entity_id` appeared at `direction` during capture `guid`."""
+        """Record that `entity_id` appeared at `direction` during capture `guid`
+        (within this Memory's scope)."""
         ts = _ts(captured_at)
         self._conn.execute(
             "INSERT OR IGNORE INTO entity_presence "
-            "(entity_id, direction, guid, captured_at, ts) VALUES (?, ?, ?, ?, ?)",
-            (entity_id, direction, guid, captured_at, ts),
+            "(scope, entity_id, direction, guid, captured_at, ts) VALUES (?, ?, ?, ?, ?, ?)",
+            (self.scope, entity_id, direction, guid, captured_at, ts),
         )
         self._conn.commit()
 
@@ -440,9 +515,10 @@ class Memory:
         ts = _ts(captured_at)
         self._conn.execute(
             "INSERT OR IGNORE INTO monitored_captures "
-            "(direction, region, guid, captured_at, ts, is_day) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (direction, region, guid, captured_at, ts, 1 if is_day else 0),
+            "(scope, direction, region, guid, captured_at, ts, is_day) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (self.scope, direction, region, guid, captured_at, ts,
+             1 if is_day else 0),
         )
         self._conn.commit()
 
@@ -453,13 +529,13 @@ class Memory:
         cutoff = _ts(now) - self.entity_baseline_window_days * 86400.0
         num_pres = self._conn.execute(
             "SELECT COUNT(*) FROM entity_presence "
-            "WHERE entity_id = ? AND direction = ? AND ts >= ?",
-            (entity_id, direction, cutoff),
+            "WHERE scope = ? AND entity_id = ? AND direction = ? AND ts >= ?",
+            (self.scope, entity_id, direction, cutoff),
         ).fetchone()[0]
         num_mon = self._conn.execute(
             "SELECT COUNT(*) FROM monitored_captures "
-            "WHERE direction = ? AND ts >= ? AND is_day = 1",
-            (direction, cutoff),
+            "WHERE scope = ? AND direction = ? AND ts >= ? AND is_day = 1",
+            (self.scope, direction, cutoff),
         ).fetchone()[0]
         if num_mon == 0:
             return 0.0
@@ -500,9 +576,10 @@ class Memory:
         if match is None:
             self._conn.execute(
                 "INSERT INTO memory_observations "
-                "(direction, bbox, first_seen_at, last_seen_at, capture_count, classes_seen) "
-                "VALUES (?, ?, ?, ?, 1, ?)",
-                (direction, json.dumps(list(bbox)), now, now, json.dumps([cls])),
+                "(scope, direction, bbox, first_seen_at, last_seen_at, capture_count, classes_seen) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?)",
+                (self.scope, direction, json.dumps(list(bbox)), now, now,
+                 json.dumps([cls])),
             )
             capture_count = 1
             first_seen_at = now
@@ -514,8 +591,8 @@ class Memory:
                 classes.append(cls)
             self._conn.execute(
                 "UPDATE memory_observations SET capture_count = ?, last_seen_at = ?, "
-                "classes_seen = ? WHERE id = ?",
-                (capture_count, now, json.dumps(classes), oid),
+                "classes_seen = ? WHERE scope = ? AND id = ?",
+                (capture_count, now, json.dumps(classes), self.scope, oid),
             )
         self._conn.commit()
 
@@ -623,21 +700,23 @@ class Memory:
 
     def _entity_expected(self, entity_id: str) -> bool:
         row = self._conn.execute(
-            "SELECT expected FROM entities WHERE entity_id = ?", (entity_id,)
+            "SELECT expected FROM entities WHERE scope = ? AND entity_id = ?",
+            (self.scope, entity_id)
         ).fetchone()
         return bool(row and row[0])
 
     def _set_entity_expected(self, entity_id: str, expected: bool) -> None:
         self._conn.execute(
-            "UPDATE entities SET expected = ? WHERE entity_id = ?",
-            (1 if expected else 0, entity_id),
+            "UPDATE entities SET expected = ? WHERE scope = ? AND entity_id = ?",
+            (1 if expected else 0, self.scope, entity_id),
         )
         self._conn.commit()
 
     def _last_presence_ts(self, entity_id: str, direction: str) -> float | None:
         row = self._conn.execute(
-            "SELECT MAX(ts) FROM entity_presence WHERE entity_id = ? AND direction = ?",
-            (entity_id, direction),
+            "SELECT MAX(ts) FROM entity_presence "
+            "WHERE scope = ? AND entity_id = ? AND direction = ?",
+            (self.scope, entity_id, direction),
         ).fetchone()
         return row[0] if row and row[0] is not None else None
 
@@ -647,10 +726,11 @@ class Memory:
                         confidence: float, bbox: tuple[float, float, float, float],
                         description: str, decision: Decision) -> int:
         cur = self._conn.execute(
-            "INSERT INTO decisions (guid, subimage, direction, class, confidence, bbox, "
-            "description, decision, reason, decided_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (guid, subimage, direction, cls, confidence, json.dumps(list(bbox)),
-             description, decision.decision, decision.reason, _now()),
+            "INSERT INTO decisions (scope, guid, subimage, direction, class, confidence, "
+            "bbox, description, decision, reason, decided_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (self.scope, guid, subimage, direction, cls, confidence,
+             json.dumps(list(bbox)), description, decision.decision,
+             decision.reason, _now()),
         )
         self._conn.commit()
         return cur.lastrowid
@@ -658,9 +738,9 @@ class Memory:
     def record_feedback(self, decision_id: int, guid: str, subimage: int,
                         human_label: str) -> None:
         self._conn.execute(
-            "INSERT INTO feedback (decision_id, guid, subimage, human_label, flagged_at) "
-            "VALUES (?,?,?,?,?)",
-            (decision_id, guid, subimage, human_label, _now()),
+            "INSERT INTO feedback (scope, decision_id, guid, subimage, human_label, flagged_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (self.scope, decision_id, guid, subimage, human_label, _now()),
         )
         self._conn.commit()
 

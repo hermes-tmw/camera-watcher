@@ -136,7 +136,7 @@ class TestProcessCaptureMarkSeen(unittest.TestCase):
         }
 
     def test_all_downloads_fail_does_not_mark_seen(self):
-        memory = Memory(":memory:")
+        memory = Memory(":memory:", scope="taylor_hill")
         capture = self._capture()
         guid = capture["imageGuid"]
 
@@ -150,7 +150,7 @@ class TestProcessCaptureMarkSeen(unittest.TestCase):
         memory.close()
 
     def test_partial_download_marks_seen(self):
-        memory = Memory(":memory:")
+        memory = Memory(":memory:", scope="taylor_hill")
         capture = self._capture()
         guid = capture["imageGuid"]
 

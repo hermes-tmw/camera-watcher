@@ -50,7 +50,7 @@ def _capture(created="2026-09-08T11:03:00"):
 
 class TestDeferredAlert(unittest.TestCase):
     def test_alerts_once_after_threshold_deferrals(self):
-        memory = Memory(":memory:")
+        memory = Memory(":memory:", scope="taylor_hill")
         notifier = _FakeNotifier()
         capture = _capture()
         guid = capture["imageGuid"]
@@ -70,7 +70,7 @@ class TestDeferredAlert(unittest.TestCase):
         memory.close()
 
     def test_no_alert_below_threshold(self):
-        memory = Memory(":memory:")
+        memory = Memory(":memory:", scope="taylor_hill")
         notifier = _FakeNotifier()
         capture = _capture()
 
@@ -86,7 +86,7 @@ class TestDeferredAlert(unittest.TestCase):
         memory.close()
 
     def test_does_not_realert_after_alerted(self):
-        memory = Memory(":memory:")
+        memory = Memory(":memory:", scope="taylor_hill")
         notifier = _FakeNotifier()
         capture = _capture()
 
@@ -102,7 +102,7 @@ class TestDeferredAlert(unittest.TestCase):
         memory.close()
 
     def test_mark_seen_clears_deferral(self):
-        memory = Memory(":memory:")
+        memory = Memory(":memory:", scope="taylor_hill")
         notifier = _FakeNotifier()
         capture = _capture()
         guid = capture["imageGuid"]
@@ -153,7 +153,7 @@ def _old_capture(guid, hours_ago):
 
 class TestRequeueDeferred(unittest.TestCase):
     def test_requeues_only_unseen_old_captures(self):
-        memory = Memory(":memory:")
+        memory = Memory(":memory:", scope="taylor_hill")
         old_unseen = str(uuid.uuid4())
         old_seen = str(uuid.uuid4())
         recent_unseen = str(uuid.uuid4())
@@ -182,7 +182,7 @@ class TestRequeueDeferred(unittest.TestCase):
         memory.close()
 
     def test_pages_until_exhausted(self):
-        memory = Memory(":memory:")
+        memory = Memory(":memory:", scope="taylor_hill")
         # Two full pages (50 each) then an empty page, so the loop pages twice.
         page1 = [_old_capture(str(uuid.uuid4()), 48) for _ in range(50)]
         page2 = [_old_capture(str(uuid.uuid4()), 48) for _ in range(50)]

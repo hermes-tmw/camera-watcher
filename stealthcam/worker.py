@@ -313,8 +313,10 @@ def backfill(cfg, client: StealthcamClient, detector: Detector, memory: Memory,
         try:
             process_capture(capture, client, detector, None, memory, None, None,
                             subimage_dir, baseline_mode=True,
-                            day_start_hour=getattr(cfg, "day_start_hour", 7),
-                            day_end_hour=getattr(cfg, "day_end_hour", 20),
+                            day_start_hour=_scope_setting(
+                                cfg, cfg.memory_scope, "day_start_hour", 7),
+                            day_end_hour=_scope_setting(
+                                cfg, cfg.memory_scope, "day_end_hour", 20),
                             region_mapping=region_mapping)
             processed += 1
         except Exception as e:
@@ -374,11 +376,14 @@ def requeue_deferred(cfg, client: StealthcamClient, detector: Detector,
         try:
             process_capture(capture, client, detector, describer, memory,
                             notifier, dashboard, subimage_dir,
-                            night_conf_threshold=getattr(cfg, "detector_night_conf_threshold", 0.75),
-                            day_start_hour=getattr(cfg, "day_start_hour", 7),
-                            day_end_hour=getattr(cfg, "day_end_hour", 20),
-                            region_mapping=parse_region_mapping(
-                                getattr(cfg, "direction_regions", "")))
+                            night_conf_threshold=_scope_setting(
+                                cfg, None,
+                                "detector_night_conf_threshold", 0.75),
+                            day_start_hour=_scope_setting(
+                                cfg, None, "day_start_hour", 7),
+                            day_end_hour=_scope_setting(
+                                cfg, None, "day_end_hour", 20),
+                            region_mapping=_scope_region_mapping(cfg, None))
             processed += 1
         except Exception as e:
             log.error("requeue-deferred capture %s failed: %s", guid, e)
@@ -387,7 +392,11 @@ def requeue_deferred(cfg, client: StealthcamClient, detector: Detector,
 
 
 def _make_memory(cfg) -> Memory:
-    """Build a Memory wired with the configured entity/re-id parameters."""
+    """Build a Memory wired with the configured entity/re-id parameters.
+
+    The Memory is bound to ``cfg.memory_scope`` (the location this process
+    serves) — scope is required, not inferred.
+    """
     fingerprinter = OpenCVFingerprinter(
         model=cfg.reid_model,
         similarity_threshold=cfg.reid_similarity_threshold,
@@ -397,7 +406,36 @@ def _make_memory(cfg) -> Memory:
                   fingerprinter=fingerprinter,
                   entity_expected_presence_ratio=cfg.entity_expected_presence_ratio,
                   entity_baseline_window_days=cfg.entity_baseline_window_days,
-                  entity_expected_absence_days=cfg.entity_expected_absence_days)
+                  entity_expected_absence_days=cfg.entity_expected_absence_days,
+                  scope=cfg.memory_scope)
+
+
+def _scope_setting(cfg, scope: str | None, key: str, default):
+    """Per-scope setting with an explicit module default fallback.
+
+    Resolution: scopes.<scope>.<key> -> flat attr <key> -> ``default`` (the
+    module-level constant that matches the legacy hard-coded behavior). The
+    flat fallback keeps the existing Taylor Hill deploy byte-identical. Stub
+    cfgs (tests pass SimpleNamespace or None) fall through to ``default`` /
+    flat attrs exactly like the previous getattr() behavior. ``scope=None``
+    means "resolve from cfg.memory_scope" (also None-tolerant for stub cfgs).
+    """
+    if cfg is None:
+        return default
+    if scope is None:
+        scope = getattr(cfg, "memory_scope", None)
+    params = getattr(cfg, "scopes", None) or {}
+    block = params.get(scope) if (scope and isinstance(params, dict)) else None
+    if block and key in block:
+        return block[key]
+    return getattr(cfg, key, default)
+
+
+def _scope_region_mapping(cfg, scope: str | None) -> dict[str, str]:
+    if cfg is not None and scope is None:
+        scope = getattr(cfg, "memory_scope", None)
+    return parse_region_mapping(
+        _scope_setting(cfg, scope, "direction_regions", ""))
 
 
 def run_once(cfg) -> dict:
@@ -444,7 +482,7 @@ def run_once(cfg) -> dict:
                 log.error("telemetry capture failed: %s", e)
 
         total = {"alerts": 0, "flags": 0, "suppressed": 0, "detections": 0, "captures": 0}
-        region_mapping = parse_region_mapping(cfg.direction_regions)
+        region_mapping = _scope_region_mapping(cfg, cfg.memory_scope)
         for capture in new_captures:
             try:
                 s = process_capture(capture, client, detector, describer, memory,
@@ -480,12 +518,14 @@ def main() -> None:
 
     # --backfill: seed the memory baseline, then exit (run before going live).
     if "--backfill" in sys.argv:
-        if not cfg.direction_regions.strip():
+        if not _scope_region_mapping(cfg, cfg.memory_scope):
             log.warning(
-                "backfill: direction_regions is EMPTY — every frame resolves "
-                "to an unclassified region, so no entities/presence will be "
-                "seeded (P0-2 gate: entities must be > 0). Set "
-                "STEALTHCAM_DIRECTION_REGIONS before going live."
+                "backfill: direction_regions is EMPTY for scope %r — every "
+                "frame resolves to an unclassified region, so no "
+                "entities/presence will be seeded (P0-2 gate: entities must "
+                "be > 0). Set STEALTHCAM_DIRECTION_REGIONS (or the scope's "
+                "direction_regions param) before going live.",
+                cfg.memory_scope,
             )
         client = StealthcamClient(secrets_path=cfg.secrets_stealthcam)
         client.login()
@@ -494,7 +534,7 @@ def main() -> None:
         subimage_dir = Path(cfg.subimage_dir)
         subimage_dir.mkdir(parents=True, exist_ok=True)
         n = backfill(cfg, client, detector, memory, subimage_dir,
-                     region_mapping=parse_region_mapping(cfg.direction_regions),
+                     region_mapping=_scope_region_mapping(cfg, cfg.memory_scope),
                      force_seen="--backfill-force-seen" in sys.argv)
         memory.close()
         log.info("backfill complete: %d captures", n)
@@ -531,12 +571,14 @@ def main() -> None:
         return
 
     backoff = cfg.poll_interval_seconds
-    if not cfg.direction_regions.strip():
+    if not _scope_region_mapping(cfg, cfg.memory_scope):
         log.warning(
-            "live loop: direction_regions is EMPTY — vehicles in unclassified "
-            "regions fall back to the novel-vehicle policy (static -> suppress, "
-            "else alert) and the presence baseline will not run. Set "
-            "STEALTHCAM_DIRECTION_REGIONS to enable the driveway/road policy."
+            "live loop: direction_regions is EMPTY for scope %r — vehicles "
+            "in unclassified regions fall back to the novel-vehicle policy "
+            "(static -> suppress, else alert) and the presence baseline will "
+            "not run. Set STEALTHCAM_DIRECTION_REGIONS (or the scope's "
+            "direction_regions param) to enable the driveway/road policy.",
+            cfg.memory_scope,
         )
     while True:
         try:
