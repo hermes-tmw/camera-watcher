@@ -186,13 +186,14 @@ class OpenCVFingerprinter:
     model: str = "cv2-silhouette-v2"
     # Similarity threshold above which two fingerprints are "the same entity".
     # With the normalized-L2 distance below, "similarity" is 1 - distance. The
-    # v2 descriptor is discriminative enough that this strict bar separates
+    # v2 descriptor is discriminative enough that this bar separates
     # same-vehicle (rescales ~0.88) from lookalikes (~0.69) on the trust-boundary
     # constructions it was tuned against; it is configurable and should still be
     # re-tuned against a labeled set as one becomes available. When a crop is
-    # too jittered/degrated to clear the bar, identity fails CLOSED (a new
+    # too jittered/degraded to clear the bar, identity fails CLOSED (a new
     # entity -> alert), never open (wrongly matching a lookalike -> no alert).
-    similarity_threshold: float = 0.85
+    # This MUST match config.py's ``reid_similarity_threshold`` default.
+    similarity_threshold: float = 0.80
 
     def fingerprint(self, crop: Image.Image) -> bytes | None:
         try:
