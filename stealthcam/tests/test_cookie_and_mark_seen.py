@@ -123,7 +123,7 @@ class _PartialClient:
 
 
 class _EmptyDetector:
-    def detect(self, image):
+    def detect(self, image, conf_threshold=None):
         return []
 
 

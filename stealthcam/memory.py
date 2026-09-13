@@ -4,22 +4,46 @@ The unifying mechanism from the design doc. For each direction we track
 persistent objects by their bounding box, and decide whether a detection is
 "static background" (seen before, persistently) or "novel".
 
+Entity-memory (2026-09-13) extends this with **identity** so "normally here"
+is no longer conflated with "static position":
+
+- Each vehicle detection crop gets a numeric re-id **fingerprint** (the
+  identity KEY) and human-readable **attributes** (make/model + side lettering)
+  from the describer VLM (the human-readable layer).
+- An entity is matched by fingerprint similarity within a direction; the
+  observation row gains an ``entity_id`` that persists across captures even if
+  the vehicle leaves and returns to the same spot.
+- Per ``entity_id x direction`` we learn an **expected-presence baseline**: the
+  fraction of monitored captures (rolling window) the entity appeared at that
+  location. High presence = "typically here" = background note (no alert);
+  low/zero prior presence = unusual = alert.
+
+Location policy (per direction):
+- ``driveway`` — vehicles get identity-expectedness evaluation (unfamiliar ->
+  alert).
+- ``road``     — pass-by: dashboard note tagged ``traffic``, no alert.
+- unclassified — fall back to the current novel-vehicle policy (static ->
+  suppress, else novel vehicle -> alert).
+
 Key design points (from the eval):
   - The parked tractor is misclassified by YOLO as *different* classes
     (car/truck/train/sheep) at *slightly jittering* bboxes across captures.
     Class is therefore NOT a reliable part of an object's identity, and exact
-    bbox equality is too strict (a few pixels of jitter). So we match objects
-    by **IoU overlap** within a direction: a detection that overlaps an
-    existing observation by >= iou_threshold is "the same object".
+    bbox equality is too strict (a few pixels of jitter). Position persistence
+    matches by **IoU overlap** within a direction; *identity* matches by
+    fingerprint, which is stable across that class drift.
   - Persistence = same direction + overlapping bbox across >=N captures AND
-    >=M hours -> static background -> suppress (any class).
+    >=M hours -> static background -> suppress (non-vehicle classes, and
+    vehicles in unclassified regions).
 
 Decision rules:
-  - static object (persistent) -> suppress (any class — it's background)
+  - static non-vehicle object -> suppress (background)
   - person  -> alert (people are transient by nature)
-  - vehicle -> alert only if novel (not static — someone drove in, not the
-               parked tractor that's always there)
   - animal  -> flag, don't alert
+  - vehicle (road) -> note (traffic), no alert
+  - vehicle (driveway, familiar) -> note (background), no alert
+  - vehicle (driveway, unfamiliar) -> alert (with make/model + lettering)
+  - vehicle (unclassified) -> static -> suppress, else novel -> alert
   - other   -> suppress
 
 The store is a SQLite DB owned by the pipeline (single-writer). It also holds
@@ -27,6 +51,7 @@ the seen_guids dedup set and the decisions/feedback tables (feedback-loop data).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -37,6 +62,11 @@ from pathlib import Path
 ALERT = "alert"
 FLAG = "flag"
 SUPPRESS = "suppress"
+NOTE = "note"
+
+# Dashboard note tags (location policy).
+TAG_TRAFFIC = "traffic"
+TAG_BACKGROUND = "background"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen_guids (
@@ -80,6 +110,34 @@ CREATE TABLE IF NOT EXISTS deferred_captures (
     first_deferred_at TEXT NOT NULL,
     last_deferred_at TEXT NOT NULL
 );
+-- Entity identity + expected-presence baseline (2026-09-13).
+CREATE TABLE IF NOT EXISTS entities (
+    entity_id TEXT PRIMARY KEY,
+    direction TEXT NOT NULL,
+    region TEXT,
+    fingerprint BLOB NOT NULL,
+    model TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    capture_count INTEGER NOT NULL DEFAULT 1,
+    attributes TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS entity_presence (
+    entity_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    guid TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    ts REAL NOT NULL,
+    PRIMARY KEY (entity_id, direction, guid)
+);
+CREATE TABLE IF NOT EXISTS monitored_captures (
+    direction TEXT NOT NULL,
+    region TEXT,
+    guid TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    ts REAL NOT NULL,
+    PRIMARY KEY (direction, guid)
+);
 """
 
 
@@ -89,6 +147,14 @@ def _now() -> str:
 
 def _parse(dt: str) -> datetime:
     return datetime.fromisoformat(dt)
+
+
+def _ts(dt: str) -> float:
+    """Epoch seconds for a capture timestamp, tolerant of naive/aware/Z forms."""
+    d = datetime.fromisoformat(dt)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.timestamp()
 
 
 def _iou(a: tuple[float, float, float, float],
@@ -110,19 +176,39 @@ def _iou(a: tuple[float, float, float, float],
 
 @dataclass
 class Decision:
-    decision: str  # alert | flag | suppress
+    decision: str  # alert | flag | suppress | note
     reason: str
     capture_count: int
     is_static: bool
+    entity_id: str | None = None
+    tag: str | None = None          # "traffic" | "background" | None
+    attributes_text: str = ""        # make/model + lettering one-liner
+
+    @property
+    def is_alert(self) -> bool:
+        return self.decision == ALERT
+
+    @property
+    def is_note(self) -> bool:
+        return self.decision == NOTE
 
 
 class Memory:
     def __init__(self, db_path: str | Path, iou_threshold: float = 0.5,
-                 static_n_captures: int = 5, static_min_hours: float = 1.0):
+                 static_n_captures: int = 5, static_min_hours: float = 1.0,
+                 fingerprinter=None,
+                 entity_expected_presence_ratio: float = 0.5,
+                 entity_baseline_window_days: float = 7.0):
         self.db_path = str(db_path)
         self.iou_threshold = iou_threshold
         self.static_n_captures = static_n_captures
         self.static_min_hours = static_min_hours
+        self.entity_expected_presence_ratio = entity_expected_presence_ratio
+        self.entity_baseline_window_days = entity_baseline_window_days
+        if fingerprinter is None:
+            from .reid import OpenCVFingerprinter
+            fingerprinter = OpenCVFingerprinter()
+        self.fingerprinter = fingerprinter
         self._conn = sqlite3.connect(self.db_path)
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
@@ -201,7 +287,7 @@ class Memory:
         ).fetchall()
         return [r[0] for r in rows]
 
-    # -- object matching -----------------------------------------------------
+    # -- object matching (position persistence) ------------------------------
 
     def _find_match(self, direction: str, bbox: tuple[float, float, float, float]):
         """Return the best-matching observation row (id, first_seen_at, count,
@@ -223,17 +309,155 @@ class Memory:
             return best
         return None
 
+    # -- entity identity -----------------------------------------------------
+
+    def _match_entity(self, direction: str, fingerprint: bytes) -> str | None:
+        """Return the entity_id of a same-model entity in `direction` whose
+        stored fingerprint matches `fingerprint`, else None."""
+        model = getattr(self.fingerprinter, "model", "")
+        rows = self._conn.execute(
+            "SELECT entity_id, fingerprint FROM entities "
+            "WHERE direction = ? AND model = ?",
+            (direction, model),
+        ).fetchall()
+        for entity_id, stored in rows:
+            if self.fingerprinter.matches(fingerprint, stored):
+                return entity_id
+        return None
+
+    def _new_entity_id(self, fingerprint: bytes) -> str:
+        digest = hashlib.sha256(fingerprint).hexdigest()[:16]
+        return f"e-{digest}"
+
+    def _resolve_entity(self, direction: str, fingerprint: bytes,
+                        attributes_text: str, attributes_json: str,
+                        now: str) -> tuple[str, bool]:
+        """Return (entity_id, created) for a fingerprint in `direction`.
+
+        Matches an existing entity by fingerprint similarity (same model); if
+        none, creates a new entity keyed on the fingerprint hash. Updates the
+        entity's last_seen_at / capture_count / attributes on every sighting.
+        """
+        model = getattr(self.fingerprinter, "model", "")
+        entity_id = self._match_entity(direction, fingerprint)
+        created = False
+        if entity_id is None:
+            entity_id = self._new_entity_id(fingerprint)
+            created = True
+            self._conn.execute(
+                "INSERT INTO entities (entity_id, direction, fingerprint, model, "
+                "first_seen_at, last_seen_at, capture_count, attributes) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+                (entity_id, direction, fingerprint, model, now, now, attributes_json),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE entities SET last_seen_at = ?, capture_count = capture_count + 1 "
+                "WHERE entity_id = ?",
+                (now, entity_id),
+            )
+            # Enrich attributes when new info appears (never overwrite a known
+            # make/model with a blank one).
+            if attributes_text:
+                self._merge_attributes(entity_id, attributes_json)
+        return entity_id, created
+
+    def _merge_attributes(self, entity_id: str, attributes_json: str) -> None:
+        cur = self._conn.execute(
+            "SELECT attributes FROM entities WHERE entity_id = ?", (entity_id,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            return
+        try:
+            existing = json.loads(row[0] or "{}")
+        except ValueError:
+            existing = {}
+        try:
+            incoming = json.loads(attributes_json or "{}")
+        except ValueError:
+            incoming = {}
+        merged = {}
+        for key in ("make", "model", "lettering"):
+            merged[key] = incoming.get(key) or existing.get(key) or ""
+        # Once confident, stay confident unless the new sighting is explicit.
+        merged["uncertain"] = incoming.get("uncertain", existing.get("uncertain", True))
+        self._conn.execute(
+            "UPDATE entities SET attributes = ? WHERE entity_id = ?",
+            (json.dumps(merged), entity_id),
+        )
+
+    def record_presence(self, entity_id: str, direction: str, guid: str,
+                        captured_at: str) -> None:
+        """Record that `entity_id` appeared at `direction` during capture `guid`."""
+        ts = _ts(captured_at)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO entity_presence "
+            "(entity_id, direction, guid, captured_at, ts) VALUES (?, ?, ?, ?, ?)",
+            (entity_id, direction, guid, captured_at, ts),
+        )
+        self._conn.commit()
+
+    def record_monitored(self, direction: str, region: str | None, guid: str,
+                         captured_at: str) -> None:
+        """Record that capture `guid` was monitored at `direction` (denominator
+        of the presence baseline), regardless of whether anything was detected."""
+        ts = _ts(captured_at)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO monitored_captures "
+            "(direction, region, guid, captured_at, ts) VALUES (?, ?, ?, ?, ?)",
+            (direction, region, guid, captured_at, ts),
+        )
+        self._conn.commit()
+
+    def presence_ratio(self, entity_id: str, direction: str,
+                       now: str) -> float:
+        """Fraction of monitored captures (rolling window) the entity appeared
+        at `direction`. 0.0 when there is no monitored history yet."""
+        cutoff = _ts(now) - self.entity_baseline_window_days * 86400.0
+        num_pres = self._conn.execute(
+            "SELECT COUNT(*) FROM entity_presence "
+            "WHERE entity_id = ? AND direction = ? AND ts >= ?",
+            (entity_id, direction, cutoff),
+        ).fetchone()[0]
+        num_mon = self._conn.execute(
+            "SELECT COUNT(*) FROM monitored_captures "
+            "WHERE direction = ? AND ts >= ?",
+            (direction, cutoff),
+        ).fetchone()[0]
+        if num_mon == 0:
+            return 0.0
+        return num_pres / float(num_mon)
+
     # -- decision ------------------------------------------------------------
 
     def decide(self, direction: str, cls: str, bbox: tuple[float, float, float, float],
-               now: str | None = None) -> Decision:
+               now: str | None = None, *,
+               fingerprint: bytes | None = None,
+               region: str | None = None,
+               attributes: object | None = None,
+               attributes_text: str = "",
+               guid: str | None = None) -> Decision:
         """Record the observation and return the alert decision.
 
-        `cls` is the YOLO class name (e.g. 'person', 'car', 'sheep'). The
-        category is derived from it. Static suppression applies to any class.
+        ``cls`` is the YOLO class name (e.g. 'person', 'car', 'sheep'). The
+        category is derived from it. Static suppression applies to non-vehicle
+        classes and to vehicles in unclassified regions.
+
+        Entity-memory additions (all keyword-only, backward compatible):
+
+        - ``fingerprint`` — the re-id bytes for a vehicle crop (identity key).
+        - ``region``     — the resolved spatial region ("driveway"/"road"/None).
+        - ``attributes`` — a VehicleAttributes (make/model/lettering).
+        - ``guid``       — the capture guid, used to dedupe presence/monitored
+          rows (falls back to ``now`` when absent).
         """
         now = now or _now()
         category = _category(cls)
+        attr_text = attributes_text
+        if attr_text == "" and attributes is not None and hasattr(attributes, "as_text"):
+            attr_text = attributes.as_text()
+        attr_json = _attributes_json(attributes)
 
         match = self._find_match(direction, bbox)
 
@@ -263,16 +487,65 @@ class Memory:
         span_hours = (_parse(now) - _parse(first_seen_at)).total_seconds() / 3600.0
         is_static = capture_count >= self.static_n_captures and span_hours >= self.static_min_hours
 
+        # --- vehicles: identity + location policy (settled decisions 1-3) ---
+        if category == "vehicle":
+            return self._decide_vehicle(
+                direction, cls, now, fingerprint, region, attr_text, attr_json,
+                guid, capture_count, is_static, span_hours,
+            )
+
+        # --- non-vehicles: existing behavior, unchanged --------------------
         if is_static:
             return Decision(SUPPRESS, f"static object ({cls}, {capture_count} captures over {span_hours:.1f}h)",
                            capture_count, True)
         if category == "person":
             return Decision(ALERT, "person", capture_count, False)
-        if category == "vehicle":
-            return Decision(ALERT, "novel vehicle", capture_count, False)
         if category == "animal":
             return Decision(FLAG, "animal", capture_count, False)
         return Decision(SUPPRESS, f"non-target class {cls}", capture_count, False)
+
+    def _decide_vehicle(self, direction: str, cls: str, now: str,
+                        fingerprint: bytes | None, region: str | None,
+                        attr_text: str, attr_json: str, guid: str | None,
+                        capture_count: int, is_static: bool,
+                        span_hours: float) -> Decision:
+        if region == "road":
+            # Pass-by: note only, no alert (still capture make/model + lettering).
+            return Decision(NOTE, f"vehicle pass-by ({cls})", capture_count, False,
+                            tag=TAG_TRAFFIC, attributes_text=attr_text)
+
+        if region == "driveway":
+            # Identity-expectedness evaluation.
+            if fingerprint is None:
+                # Cannot identify — conservative: treat as novel.
+                return Decision(ALERT, "unidentified vehicle (no fingerprint)",
+                                capture_count, False, attributes_text=attr_text)
+            entity_id, created = self._resolve_entity(
+                direction, fingerprint, attr_text, attr_json, now)
+            key = guid or now
+            self.record_presence(entity_id, direction, key, now)
+            ratio = self.presence_ratio(entity_id, direction, now)
+            if created or ratio < self.entity_expected_presence_ratio:
+                label = attr_text or "vehicle"
+                return Decision(
+                    ALERT,
+                    f"unfamiliar vehicle ({label}; presence {ratio:.0%})",
+                    capture_count, False, entity_id=entity_id,
+                    attributes_text=attr_text,
+                )
+            return Decision(
+                NOTE,
+                f"expected vehicle ({cls}, presence {ratio:.0%})",
+                capture_count, False, entity_id=entity_id,
+                tag=TAG_BACKGROUND, attributes_text=attr_text,
+            )
+
+        # Unclassified region -> current novel-vehicle policy.
+        if is_static:
+            return Decision(SUPPRESS, f"static object ({cls}, {capture_count} captures over {span_hours:.1f}h)",
+                           capture_count, True)
+        return Decision(ALERT, "novel vehicle", capture_count, False,
+                        attributes_text=attr_text)
 
     # -- decisions / feedback (feedback-loop data) ---------------------------
 
@@ -299,6 +572,15 @@ class Memory:
 
     def close(self) -> None:
         self._conn.close()
+
+
+def _attributes_json(attributes: object | None) -> str:
+    if attributes is None:
+        return "{}"
+    if hasattr(attributes, "__dict__"):
+        d = {k: v for k, v in attributes.__dict__.items()}
+        return json.dumps(d)
+    return "{}"
 
 
 def _category(cls: str) -> str:

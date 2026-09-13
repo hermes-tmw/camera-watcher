@@ -18,10 +18,12 @@ from .client import StealthcamClient, StealthcamError
 from .config import load_config
 from .detector import Detector
 from .describer import Describer
-from .memory import Memory, ALERT, FLAG, SUPPRESS
+from .memory import Memory, ALERT, FLAG, SUPPRESS, NOTE
 from .annotate import annotate
 from .notify import Notifier
 from .dashboard import DashboardWriter
+from .context import resolve_region, is_night, parse_region_mapping
+from .reid import OpenCVFingerprinter
 
 log = logging.getLogger("stealthcam.worker")
 
@@ -43,7 +45,9 @@ def process_capture(capture: dict, client: StealthcamClient, detector: Detector,
                     describer: Describer, memory: Memory, notifier: Notifier,
                     dashboard: DashboardWriter | None, subimage_dir: Path,
                     baseline_mode: bool = False,
-                    deferred_alert_threshold: int = 3) -> dict:
+                    deferred_alert_threshold: int = 3,
+                    night_conf_threshold: float = 0.75,
+                    region_mapping: dict[str, str] | None = None) -> dict:
     """Process one capture (6 sub-images). Returns a summary dict.
 
     In `baseline_mode`, we detect + record memory observations but do NOT
@@ -54,12 +58,21 @@ def process_capture(capture: dict, client: StealthcamClient, detector: Detector,
     `deferred_alert_threshold` is the number of consecutive polls a capture
     must be deferred (all sub-images failed) before a Mattermost alert is
     posted. The alert fires at most once per guid (tracked in the memory DB).
+
+    Entity-memory wiring: at night the detector confidence bar is raised to
+    `night_conf_threshold` (IR noise suppression); each vehicle crop gets a
+    re-id fingerprint (identity key) + VLM make/model/lettering (attributes);
+    each sub-image is classified into a spatial region (driveway/road) so the
+    memory decision can apply the location + expected-presence policy.
     """
     guid = capture["imageGuid"]
     directions = capture.get("imageDirections") or [f"dir{i}" for i in range(1, 7)]
     created_dt = capture.get("createdDateTime", "")
 
-    summary = {"guid": guid, "alerts": 0, "flags": 0, "suppressed": 0, "detections": 0}
+    summary = {"guid": guid, "alerts": 0, "flags": 0, "suppressed": 0,
+               "detections": 0, "notes": 0}
+    night = is_night(created_dt)
+    conf_bar = night_conf_threshold if night else detector.conf_threshold
 
     downloaded_any = False
     for n in range(1, 7):
@@ -74,32 +87,71 @@ def process_capture(capture: dict, client: StealthcamClient, detector: Detector,
 
         from PIL import Image
         img = Image.open(local)
-        detections = detector.detect(img)
+        # Night confidence gate: raise the bar at night to kill IR noise.
+        detections = detector.detect(img, conf_threshold=conf_bar)
+
+        # Record this sub-image as "monitored" so the presence baseline has a
+        # correct denominator even when nothing is detected here.
+        region_of_frame = resolve_region(direction, mapping=region_mapping)
+        if region_of_frame in ("driveway", "road"):
+            memory.record_monitored(direction, region_of_frame, f"{guid}_{n}",
+                                    created_dt)
 
         # describe each detection (crop + VLM) — skipped in baseline mode
         descriptions: dict[int, str] = {}
+        attributes: dict[int, object] = {}
+        fingerprints: dict[int, bytes] = {}
         if not baseline_mode:
             for i, det in enumerate(detections):
                 x1, y1, x2, y2 = [int(v) for v in det.bbox]
                 crop = img.crop((x1, y1, x2, y2))
-                try:
-                    descriptions[i] = describer.describe(crop)
-                except Exception as e:
-                    log.warning("describe %s_%d det %d failed: %s", guid, n, i, e)
-                    descriptions[i] = ""
+                if det.category == "vehicle":
+                    # Attributes (make/model/lettering) — best-effort, with
+                    # uncertainty; never raise into the decision path.
+                    try:
+                        attributes[i] = describer.describe_vehicle(crop)
+                        descriptions[i] = attributes[i].as_text()
+                    except Exception as e:
+                        log.warning("describe_vehicle %s_%d det %d failed: %s",
+                                    guid, n, i, e)
+                    # Identity key: silhouette/geometry fingerprint (robust
+                    # where lettering washes out under IR).
+                    try:
+                        fingerprints[i] = memory.fingerprinter.fingerprint(crop)
+                    except Exception as e:
+                        log.warning("fingerprint %s_%d det %d failed: %s",
+                                    guid, n, i, e)
+                else:
+                    try:
+                        descriptions[i] = describer.describe(crop)
+                    except Exception as e:
+                        log.warning("describe %s_%d det %d failed: %s", guid, n, i, e)
+                        descriptions[i] = ""
 
         # memory decision per detection — keyed on the CAPTURE's timestamp, not
         # wall-clock processing time (persistence is measured in capture time).
         now = created_dt or None
         alert_dets = []
         for i, det in enumerate(detections):
-            decision = memory.decide(direction, det.cls, det.bbox, now=now)
+            region = resolve_region(direction, det.bbox,
+                                    frame=(img.width, img.height),
+                                    mapping=region_mapping)
+            decision = memory.decide(
+                direction, det.cls, det.bbox, now=now,
+                fingerprint=fingerprints.get(i),
+                region=region,
+                attributes=attributes.get(i),
+                attributes_text=descriptions.get(i, ""),
+                guid=guid,
+            )
             summary["detections"] += 1
             if decision.decision == ALERT:
                 summary["alerts"] += 1
                 alert_dets.append((i, det, decision))
             elif decision.decision == FLAG:
                 summary["flags"] += 1
+            elif decision.decision == NOTE:
+                summary["notes"] += 1
             else:
                 summary["suppressed"] += 1
 
@@ -116,10 +168,18 @@ def process_capture(capture: dict, client: StealthcamClient, detector: Detector,
                     and det.category in ("person", "vehicle", "animal")
                     and decision.decision != SUPPRESS):
                 try:
-                    dashboard.write_detection(
-                        guid, n, direction, det.category, det.confidence,
-                        descriptions.get(i, ""), created_dt, det.bbox, i,
-                    )
+                    if decision.decision == NOTE:
+                        dashboard.write_note(
+                            guid, n, direction, det.category, det.confidence,
+                            decision.reason, created_dt, det.bbox, i,
+                            tag=decision.tag,
+                            make_model_lettering=decision.attributes_text,
+                        )
+                    else:
+                        dashboard.write_detection(
+                            guid, n, direction, det.category, det.confidence,
+                            descriptions.get(i, ""), created_dt, det.bbox, i,
+                        )
                 except Exception as e:
                     log.error("dashboard write %s_%d det %d failed: %s", guid, n, i, e)
 
@@ -269,12 +329,28 @@ def requeue_deferred(cfg, client: StealthcamClient, detector: Detector,
             continue
         try:
             process_capture(capture, client, detector, describer, memory,
-                            notifier, dashboard, subimage_dir)
+                            notifier, dashboard, subimage_dir,
+                            night_conf_threshold=getattr(cfg, "detector_night_conf_threshold", 0.75),
+                            region_mapping=parse_region_mapping(
+                                getattr(cfg, "direction_regions", "")))
             processed += 1
         except Exception as e:
             log.error("requeue-deferred capture %s failed: %s", guid, e)
     log.info("requeue-deferred done: %d captures", processed)
     return processed
+
+
+def _make_memory(cfg) -> Memory:
+    """Build a Memory wired with the configured entity/re-id parameters."""
+    fingerprinter = OpenCVFingerprinter(
+        model=cfg.reid_model,
+        similarity_threshold=cfg.reid_similarity_threshold,
+    )
+    return Memory(cfg.pipeline_db, cfg.memory_iou_threshold,
+                  cfg.memory_static_n_captures, cfg.memory_static_min_hours,
+                  fingerprinter=fingerprinter,
+                  entity_expected_presence_ratio=cfg.entity_expected_presence_ratio,
+                  entity_baseline_window_days=cfg.entity_baseline_window_days)
 
 
 def run_once(cfg) -> dict:
@@ -283,8 +359,7 @@ def run_once(cfg) -> dict:
 
     detector = Detector(cfg.detector_weights, cfg.detector_conf_threshold, cfg.detector_device)
     describer = Describer(cfg.describer_model, cfg.describer_ollama_host, cfg.describer_timeout)
-    memory = Memory(cfg.pipeline_db, cfg.memory_iou_threshold,
-                    cfg.memory_static_n_captures, cfg.memory_static_min_hours)
+    memory = _make_memory(cfg)
     notifier = Notifier(cfg.mattermost_base_url, cfg.mattermost_channel_id,
                         cfg.mattermost_bot, cfg.secrets_mattermost)
     # Dashboard is secondary to alerting: if camera-watcher Postgres is down
@@ -322,10 +397,13 @@ def run_once(cfg) -> dict:
                 log.error("telemetry capture failed: %s", e)
 
         total = {"alerts": 0, "flags": 0, "suppressed": 0, "detections": 0, "captures": 0}
+        region_mapping = parse_region_mapping(cfg.direction_regions)
         for capture in new_captures:
             s = process_capture(capture, client, detector, describer, memory,
                                 notifier, dashboard, subimage_dir,
-                                deferred_alert_threshold=cfg.deferred_alert_threshold)
+                                deferred_alert_threshold=cfg.deferred_alert_threshold,
+                                night_conf_threshold=cfg.detector_night_conf_threshold,
+                                region_mapping=region_mapping)
             total["captures"] += 1
             for k in ("alerts", "flags", "suppressed", "detections"):
                 total[k] += s[k]
@@ -345,8 +423,7 @@ def main() -> None:
         client = StealthcamClient(secrets_path=cfg.secrets_stealthcam)
         client.login()
         detector = Detector(cfg.detector_weights, cfg.detector_conf_threshold, cfg.detector_device)
-        memory = Memory(cfg.pipeline_db, cfg.memory_iou_threshold,
-                        cfg.memory_static_n_captures, cfg.memory_static_min_hours)
+        memory = _make_memory(cfg)
         subimage_dir = Path(cfg.subimage_dir)
         subimage_dir.mkdir(parents=True, exist_ok=True)
         n = backfill(cfg, client, detector, memory, subimage_dir)
@@ -362,8 +439,7 @@ def main() -> None:
         client.login()
         detector = Detector(cfg.detector_weights, cfg.detector_conf_threshold, cfg.detector_device)
         describer = Describer(cfg.describer_model, cfg.describer_ollama_host, cfg.describer_timeout)
-        memory = Memory(cfg.pipeline_db, cfg.memory_iou_threshold,
-                        cfg.memory_static_n_captures, cfg.memory_static_min_hours)
+        memory = _make_memory(cfg)
         notifier = Notifier(cfg.mattermost_base_url, cfg.mattermost_channel_id,
                             cfg.mattermost_bot, cfg.secrets_mattermost)
         dashboard: DashboardWriter | None = None

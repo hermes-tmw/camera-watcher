@@ -121,6 +121,74 @@ class DashboardWriter:
             self._conn.rollback()
             raise
 
+    def write_note(self, guid: str, subimage: int, direction: str,
+                   category: str, confidence: float, note_text: str,
+                   created_dt: str, bbox: tuple[float, float, float, float],
+                   detection_index: int, tag: str | None = None,
+                   make_model_lettering: str = "") -> int:
+        """Write a non-alert observation (traffic / background note).
+
+        A pass-by on the road and an expected vehicle in the driveway are
+        *noted, not alerted*. This writes the same EventObservation + Labeling +
+        IntermediateResult shape as ``write_detection``, but tags the event so
+        the dashboard can distinguish it from an alert. ``tag`` is ``traffic``
+        or ``background`` (surfaced via the labeling description so the note
+        is self-describing). ``make_model_lettering`` carries the VLM-extracted
+        make/model + lettering when available.
+        """
+        event_name = f"{guid}_{subimage}_{detection_index}"
+        video_file = f"{guid}_{subimage}.JPG"
+        video_location = "stealthcam"
+        capture_time = self._capture_time_naive(created_dt)
+        lighting = self._lighting(self._capture_time_mountain(created_dt))
+
+        desc_parts = [p for p in (note_text, make_model_lettering) if p]
+        description = " | ".join(desc_parts) or None
+        if tag:
+            description = (f"[{tag}] " + description) if description else f"[{tag}]"
+
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO event_observations "
+                "(event_name, video_file, capture_time, scene_name, storage_local, "
+                " video_location, lighting_type, camera) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (event_name) DO NOTHING RETURNING id",
+                (event_name, video_file, capture_time, direction, True,
+                 video_location, lighting, "stealthcam"),
+            )
+            row = cur.fetchone()
+            if row is None:
+                cur.execute("SELECT id FROM event_observations WHERE event_name = %s",
+                            (event_name,))
+                row = cur.fetchone()
+            event_id = row[0]
+
+            cur.execute(
+                "INSERT INTO labelings "
+                "(decider, decided_at, labels, probabilities, description, git_version, event_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                ("yolo11n+vlm", datetime.now(), json.dumps([category]),
+                 json.dumps([confidence]), description, self.git_version, event_id),
+            )
+
+            relpath = self._subimage_relpath(guid, subimage)
+            cur.execute(
+                "INSERT INTO intermediate_results "
+                "(computed_at, step, info, file, event_id) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (datetime.now(), "stealthcam_note",
+                 json.dumps({"bbox": list(bbox), "direction": direction,
+                             "tag": tag}),
+                 relpath, event_id),
+            )
+            self._conn.commit()
+            return event_id
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def write_telemetry(self, status: dict) -> int:
         """Persist one device-status snapshot into `stealthcam_telemetry`.
 
