@@ -1172,6 +1172,180 @@ CREATE TABLE monitored_captures (
         finally:
             conn.close()
 
+    # -- issue #47: the epoch stamp must never attest an unverified PK -----
+    # A mixed-shape DB (monitored_captures already scoped with the epoch-1
+    # region-blind PK + any other _SCOPE_TABLES table still unscoped) used
+    # to take the rebuild branch, which never ran _upgrade_pk_shapes, while
+    # Memory.__init__ stamped the epoch unconditionally: user_version=N over
+    # a region-blind PK, trusted forever by the fast path (issue #44's
+    # silent road-row drop reborn, zero errors anywhere).
+
+    def _mixed_shape_db(self) -> Path:
+        """Build the issue #47 shape: scoped epoch-1-PK monitored_captures
+        alongside an unscoped seen_guids."""
+        path = self.dir / "mixed.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript("""
+CREATE TABLE monitored_captures (
+    scope TEXT NOT NULL DEFAULT 'taylor_hill',
+    direction TEXT NOT NULL, region TEXT, guid TEXT NOT NULL,
+    captured_at TEXT NOT NULL, ts REAL NOT NULL,
+    is_day INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (scope, direction, guid));
+CREATE TABLE seen_guids (guid TEXT, seen_at TEXT NOT NULL);
+""")
+        conn.execute(
+            "INSERT INTO monitored_captures (scope, direction, region, "
+            "guid, captured_at, ts, is_day) VALUES "
+            "('taylor_hill', 'West', 'driveway', 'f1', ?, 1.0, 1)",
+            (_iso(_T0),))
+        conn.execute("INSERT INTO seen_guids VALUES ('g1', ?)", (_iso(_T0),))
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_memory_open_mixed_shape_raises_and_never_stamps(self):
+        # Memory open must REFUSE loudly (RuntimeError naming table+shape),
+        # not stamp: user_version stays 0 and the PK is untouched.
+        path = self._mixed_shape_db()
+        with self.assertRaises(RuntimeError) as ctx:
+            Memory(str(path), scope="taylor_hill",
+                   fingerprinter=_TrivialFingerprinter())
+        self.assertIn("monitored_captures", str(ctx.exception))
+        conn = sqlite3.connect(str(path))
+        try:
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0], 0,
+                "a refused open must NEVER stamp the schema epoch")
+            self.assertEqual(
+                self._pk(conn, "monitored_captures"),
+                ["scope", "direction", "guid"],
+                "a refused open must not half-upgrade the attested table")
+        finally:
+            conn.close()
+
+    def test_cli_migrate_mixed_shape_raises_then_rerun_repairs(self):
+        # The CLI hits the same refusal on the first pass (the rebuild of
+        # the unscoped table committed, the PK verification refused the
+        # stamp); a RE-RUN self-heals: everything is scoped by then, so the
+        # all-scoped branch upgrades the PK and stamps. Asserting WHICH of
+        # the card's two sanctioned behaviors happens, in order.
+        path = self._mixed_shape_db()
+        from stealthcam.migrate import main as migrate_main
+        with self.assertRaises(RuntimeError) as ctx:
+            migrate_main([str(path), "--no-backup"])
+        self.assertIn("monitored_captures", str(ctx.exception))
+        self.assertEqual(migrate_main([str(path), "--no-backup"]), 0)
+        conn = sqlite3.connect(str(path))
+        try:
+            self.assertEqual(
+                self._pk(conn, "monitored_captures"),
+                ["scope", "direction", "region", "guid"])
+            self.assertEqual(self._pk(conn, "seen_guids"), ["scope", "guid"])
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                SCHEMA_EPOCH_USER_VERSION)
+        finally:
+            conn.close()
+
+    def test_no_path_stamps_epoch_over_region_blind_pk(self):
+        # Regression for probe_mixed_shape.py: pre-fix, the mixed-shape DB
+        # OPENED successfully with user_version=2 over a region-blind PK.
+        # After the fix, every DB Memory opens successfully must satisfy
+        # epoch == current  =>  monitored_captures PK is region-aware, and
+        # the mixed shape must not open at all.
+        opened = {}
+        fresh = self.dir / "inv-fresh.db"
+        Memory(str(fresh), scope="taylor_hill",
+               fingerprinter=_TrivialFingerprinter()).close()
+        opened["fresh"] = fresh
+        epoch1 = self._epoch1_db()[0]
+        Memory(str(epoch1), scope="taylor_hill",
+               fingerprinter=_TrivialFingerprinter()).close()
+        opened["epoch1"] = epoch1
+        legacy = self.dir / "inv-legacy.db"
+        conn = sqlite3.connect(str(legacy))
+        conn.executescript(
+            "CREATE TABLE seen_guids (guid TEXT, seen_at TEXT NOT NULL);")
+        conn.commit()
+        conn.close()
+        Memory(str(legacy), scope="taylor_hill",
+               fingerprinter=_TrivialFingerprinter()).close()
+        opened["legacy"] = legacy
+        for name, path in opened.items():
+            conn = sqlite3.connect(str(path))
+            try:
+                epoch = conn.execute("PRAGMA user_version").fetchone()[0]
+                pk = self._pk(conn, "monitored_captures")
+                self.assertEqual(epoch, SCHEMA_EPOCH_USER_VERSION,
+                                 f"{name}: open must stamp the epoch")
+                self.assertEqual(
+                    pk, ["scope", "direction", "region", "guid"],
+                    f"{name}: a stamped epoch attests the region-aware PK")
+            finally:
+                conn.close()
+        mixed = self._mixed_shape_db()
+        with self.assertRaises(RuntimeError):
+            Memory(str(mixed), scope="taylor_hill",
+                   fingerprinter=_TrivialFingerprinter())
+        conn = sqlite3.connect(str(mixed))
+        try:
+            self.assertNotEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                SCHEMA_EPOCH_USER_VERSION,
+                "mixed shape must never carry the current epoch")
+        finally:
+            conn.close()
+
+    def test_lying_epoch2_stamp_refused_on_next_open(self):
+        # The DB the BUGGY code already stamped (epoch 2 over a region-blind
+        # PK — the only durable damage issue #47 could have left on disk):
+        # the epoch bump to 3 must force the full check, which refuses
+        # loudly instead of trusting the lying stamp on the fast path.
+        path = self._mixed_shape_db()
+        conn = sqlite3.connect(str(path))
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        conn.close()
+        with self.assertRaises(RuntimeError) as ctx:
+            Memory(str(path), scope="taylor_hill",
+                   fingerprinter=_TrivialFingerprinter())
+        self.assertIn("monitored_captures", str(ctx.exception))
+        conn = sqlite3.connect(str(path))
+        try:
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0], 2,
+                "refused open must leave the pre-existing stamp untouched")
+        finally:
+            conn.close()
+
+    def test_cli_migrate_keeps_epoch_backup_with_old_pk(self):
+        # Sibling of test_cli_migrate_reports_pk_upgrade WITHOUT
+        # --no-backup: the CLI epoch-backup line (PR #46) gets a regression
+        # test — the one-time .pre-epoch2-pk-upgrade.bak must exist and hold
+        # the OLD (epoch-1, region-blind) PK shape.
+        path, _ = self._epoch1_db()
+        from stealthcam.migrate import main as migrate_main
+        self.assertEqual(migrate_main([str(path)]), 0)
+        bak = path.with_name(path.name + ".pre-epoch2-pk-upgrade.bak")
+        self.assertTrue(bak.is_file(),
+                        "CLI default must keep the epoch backup")
+        bak_conn = sqlite3.connect(str(bak))
+        try:
+            self.assertEqual(
+                self._pk(bak_conn, "monitored_captures"),
+                ["scope", "direction", "guid"],
+                "backup must hold the OLD PK shape")
+        finally:
+            bak_conn.close()
+        conn = sqlite3.connect(str(path))
+        try:
+            self.assertEqual(
+                self._pk(conn, "monitored_captures"),
+                ["scope", "direction", "region", "guid"])
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

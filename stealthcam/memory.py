@@ -324,6 +324,11 @@ class Memory:
         # epoch skips re-scanning sqlite_master on every boot. The epoch is
         # bumped whenever the scoped schema/migration changes shape; a DB
         # stamped with a DIFFERENT epoch still gets the full check.
+        # Issue #47: migrate_scoped_db itself stamps the epoch, only AFTER
+        # verifying every _PK_UPGRADES table's PK shape (loud refusal —
+        # RuntimeError — on mismatch, stamp never written). This constructor
+        # no longer stamps unconditionally: a mixed-shape DB must raise at
+        # open, never walk away attested with an unverified shape.
         cur_epoch = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if cur_epoch != SCHEMA_EPOCH_USER_VERSION:
             report = migrate_db_open(self.db_path, self._conn,
@@ -331,8 +336,6 @@ class Memory:
             if report["status"] != "already-scoped":
                 log.info("pipeline DB migrated at open: %s (%d tables)",
                          report["status"], len(report.get("tables", {})))
-            self._conn.execute(
-                f"PRAGMA user_version = {SCHEMA_EPOCH_USER_VERSION}")
         else:
             # Fast path still guards stranded rebuild artifacts (unconditional
             # — a user_version-stamped DB can still be stranded by an old

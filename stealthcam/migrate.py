@@ -58,7 +58,15 @@ DEFAULT_STAMP = "taylor_hill"
 #       PR#43 P2-4): PK widened (scope, direction, region, guid) so one
 #       frame can contribute one denominator row PER REGION; epoch-1 DBs
 #       re-run the full check on next open and get the in-place PK upgrade.
-SCHEMA_EPOCH_USER_VERSION = 2
+#   3 = verified epoch stamp (2026-09-14, issue #47 / Percy PR#46 P2): the
+#       stamp moved from Memory.__init__ into migrate_scoped_db itself and
+#       is now applied only AFTER the PK shape of every _PK_UPGRADES table
+#       is verified against the spec — a mixed-shape DB (e.g. epoch-1 PK
+#       alongside an unscoped table) refuses loudly instead of being
+#       attested as epoch 2 with a region-blind PK. Bumped so any DB the
+#       buggy code already stamped with epoch 2 re-runs the full check
+#       once on next open.
+SCHEMA_EPOCH_USER_VERSION = 3
 
 # Tables that must be rebuilt with a scope column + composite PK. Each entry:
 # (table, pk-without-scope, all-columns-with-types, not-null-columns).
@@ -160,25 +168,49 @@ _SCOPE_TABLES: dict[str, dict] = {
 }
 
 # Indexes on the scoped schema (mirror the pre-scope layout; scope-first).
-_SCOPE_INDEXES = {
-    "decisions": "CREATE INDEX IF NOT EXISTS idx_decisions_scope_guid "
-                 "ON decisions (scope, guid)",
-    "entity_presence": "CREATE INDEX IF NOT EXISTS idx_entity_presence_scope_ts "
-                       "ON entity_presence (scope, entity_id, direction, ts)",
-    "monitored_captures": "CREATE INDEX IF NOT EXISTS idx_monitored_scope_ts "
-                          "ON monitored_captures (scope, ts, is_day)",
-    "memory_observations": "CREATE INDEX IF NOT EXISTS idx_memory_obs_scope_dir "
-                           "ON memory_observations (scope, direction)",
+# Values are LISTS of CREATE INDEX statements (a table may need several —
+# issue #47 P3: the CLI/rebuild path must re-create BOTH monitored_captures
+# indexes, not just idx_monitored_scope_ts). Keep in lockstep with the
+# CREATE INDEX statements in memory.py _MEMORY_SCHEMA: anything only in
+# _MEMORY_SCHEMA self-heals on the next Memory open, but a CLI-migrated DB
+# lacks it until then.
+_SCOPE_INDEXES: dict[str, list[str]] = {
+    "decisions": [
+        "CREATE INDEX IF NOT EXISTS idx_decisions_scope_guid "
+        "ON decisions (scope, guid)",
+    ],
+    "entity_presence": [
+        "CREATE INDEX IF NOT EXISTS idx_entity_presence_scope_ts "
+        "ON entity_presence (scope, entity_id, direction, ts)",
+    ],
+    "monitored_captures": [
+        "CREATE INDEX IF NOT EXISTS idx_monitored_scope_ts "
+        "ON monitored_captures (scope, ts, is_day)",
+        # Region-aware denominator index (issue #44 / PR #46); was missing
+        # here so a CLI-migrated DB lacked it until the next Memory open.
+        "CREATE INDEX IF NOT EXISTS idx_monitored_scope_dir_region_ts "
+        "ON monitored_captures (scope, direction, region, ts, is_day)",
+    ],
+    "memory_observations": [
+        "CREATE INDEX IF NOT EXISTS idx_memory_obs_scope_dir "
+        "ON memory_observations (scope, direction)",
+    ],
 }
 
 # PK-shape fixes applied IN PLACE to already-scoped DBs (epoch upgrades).
 # Epoch-1 monitored_captures PKed on (scope, direction, guid); issue #44
 # widened it to (scope, direction, region, guid) so a frame evidencing both
 # road and driveway contributes one denominator row PER REGION. Each entry:
-# (old-pk-without-scope, new-pk-without-scope). A table whose PK already
-# matches the new shape is skipped (idempotent).
-_PK_UPGRADES: dict[str, tuple[list[str], list[str]]] = {
-    "monitored_captures": (["direction", "guid"], ["direction", "region", "guid"]),
+# (old-pk-without-scope, new-pk-without-scope, shape-epoch). ``shape-epoch``
+# is the schema generation whose PK shape this upgrade INSTALLS (the
+# region-aware shape shipped as epoch 2, PR #46) and names the one-time
+# rollback snapshot (.pre-epoch<shape-epoch>-pk-upgrade.bak). It must NOT
+# track SCHEMA_EPOCH_USER_VERSION: a stamping-protocol fix that bumps the
+# epoch (issue #47, epoch 3) changes no PK shape, and renaming the rollback
+# artifact an operator already knows would defeat its idempotence.
+_PK_UPGRADES: dict[str, tuple[list[str], list[str], int]] = {
+    "monitored_captures": (["direction", "guid"],
+                           ["direction", "region", "guid"], 2),
 }
 
 
@@ -193,7 +225,7 @@ def _upgrade_pk_shapes(conn: sqlite3.Connection, stamp: str) -> dict:
     the old PK silently collapsed — fail loudly rather than drop rows.
     """
     upgraded: dict[str, int] = {}
-    for table, (old_pk, new_pk) in _PK_UPGRADES.items():
+    for table, (old_pk, new_pk, _shape_epoch) in _PK_UPGRADES.items():
         if not _table_exists(conn, table):
             continue
         if not _is_scoped(conn, table):
@@ -225,8 +257,8 @@ def _upgrade_pk_shapes(conn: sqlite3.Connection, stamp: str) -> dict:
             )
             conn.execute(f"DROP TABLE {table}_legacy")
             conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
-            if table in _SCOPE_INDEXES:
-                conn.execute(_SCOPE_INDEXES[table])
+            for stmt in _SCOPE_INDEXES.get(table, []):
+                conn.execute(stmt)
         except BaseException:
             conn.rollback()
             raise
@@ -302,6 +334,37 @@ def _create_scoped(conn: sqlite3.Connection, table: str, spec: dict,
     conn.execute(f"CREATE TABLE {table}_new ({', '.join(col_defs)})")
 
 
+def _verify_pk_shapes(conn: sqlite3.Connection) -> None:
+    """Verify every _PK_UPGRADES table carries the current (scoped) PK.
+
+    Issue #47: the epoch stamp ATTESTS this shape, so it must be verified,
+    never assumed. The historical defect: the mixed-shape (rebuild) branch
+    returned without running _upgrade_pk_shapes while Memory.__init__
+    stamped the epoch unconditionally — a user_version=2 attest over a
+    region-blind monitored_captures PK, and the fast path trusted the lying
+    stamp on every later boot (issue #44's silent road-row drop reborn,
+    zero errors anywhere). A mismatch here refuses loudly (same contract as
+    assert_no_orphan_rebuild_tables), leaves the stamp unwritten, and the
+    DB keeps its old epoch so the full check re-runs after reconciliation.
+    """
+    for table, (_old_pk, new_pk, _shape_epoch) in _PK_UPGRADES.items():
+        if not _table_exists(conn, table):
+            continue
+        cur = _pk_cols(conn, table)
+        if cur != ["scope"] + new_pk:
+            raise RuntimeError(
+                f"{table}: PK {cur} is not the required scoped shape "
+                f"{['scope'] + new_pk}; refusing to stamp schema epoch "
+                f"{SCHEMA_EPOCH_USER_VERSION} over an unverified shape "
+                f"(manual reconciliation required)")
+
+
+def _stamp_epoch(conn: sqlite3.Connection) -> None:
+    """Stamp the schema epoch. Called ONLY from migrate_scoped_db, only on
+    exits whose PK verification passed (issue #47)."""
+    conn.execute(f"PRAGMA user_version = {SCHEMA_EPOCH_USER_VERSION}")
+
+
 def migrate_scoped_db(conn: sqlite3.Connection,
                       stamp: str = DEFAULT_STAMP) -> dict:
     """Bring a (possibly pre-scope) pipeline DB to the scoped schema.
@@ -311,6 +374,14 @@ def migrate_scoped_db(conn: sqlite3.Connection,
     (created empty scoped tables).
 
     Idempotent. Additive: existing rows are preserved with scope=stamp.
+
+    Epoch stamping (issue #47): this function — not Memory.__init__ —
+    writes ``PRAGMA user_version = SCHEMA_EPOCH_USER_VERSION``, and only
+    after verifying every _PK_UPGRADES table's PK matches the current
+    scoped shape (``_verify_pk_shapes``). A mismatch raises RuntimeError
+    naming the table and shape, consistent with
+    assert_no_orphan_rebuild_tables; the stamp is never written over an
+    unverified shape, so the next open re-runs the full check.
 
     Crash safety: each table's rebuild (RENAME -> CREATE _new -> INSERT ->
     DROP legacy -> RENAME back) runs inside ONE explicit BEGIN IMMEDIATE /
@@ -336,6 +407,11 @@ def migrate_scoped_db(conn: sqlite3.Connection,
 
         conn.executescript(MEMORY_SCHEMA)
         report["status"] = "fresh"
+        # _MEMORY_SCHEMA builds every _PK_UPGRADES table in the current
+        # shape, so the stamp below is preceded by the same verification
+        # every other exit runs (defense in depth, issue #47).
+        _verify_pk_shapes(conn)
+        _stamp_epoch(conn)
         return report
 
     not_scoped = [t for t in scoped_targets if not _is_scoped(conn, t)]
@@ -355,6 +431,8 @@ def migrate_scoped_db(conn: sqlite3.Connection,
                     f"{t} has a scope column but PK {pk} does not start with "
                     f"scope — schema is neither legacy nor scoped; refusing "
                     f"to guess (manual reconciliation required)")
+        _verify_pk_shapes(conn)
+        _stamp_epoch(conn)
         return report
 
     # -- rebuild path: every not-yet-scoped table is copied + stamped --------
@@ -387,8 +465,8 @@ def migrate_scoped_db(conn: sqlite3.Connection,
             )
             conn.execute(f"DROP TABLE {table}_legacy")
             conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
-            if table in _SCOPE_INDEXES:
-                conn.execute(_SCOPE_INDEXES[table])
+            for stmt in _SCOPE_INDEXES.get(table, []):
+                conn.execute(stmt)
         except BaseException:
             conn.rollback()
             raise
@@ -399,6 +477,14 @@ def migrate_scoped_db(conn: sqlite3.Connection,
     for table in scoped_targets:
         if table not in not_scoped:
             report["tables"][table] = 0
+    # Issue #47: the rebuild branch previously returned WITHOUT running
+    # _upgrade_pk_shapes, so a mixed-shape DB (e.g. epoch-1 monitored_captures
+    # PK + an unscoped seen_guids) got the epoch stamp attesting a PK shape
+    # it never had or verified — and the fast path trusted that stamp
+    # forever. Verify before stamping: a mismatch raises here, the stamp is
+    # never written, and Memory-open surfaces the refusal loudly.
+    _verify_pk_shapes(conn)
+    _stamp_epoch(conn)
     return report
 
 
@@ -448,15 +534,21 @@ def _ensure_backup(db_path: Path, backup_dir: str | None = None) -> Path | None:
     return target
 
 
-def _pk_upgrade_pending(conn: sqlite3.Connection) -> bool:
-    """True when an already-scoped table still carries a pre-epoch PK shape
-    that _upgrade_pk_shapes would rebuild (used to decide the epoch backup)."""
-    for table, (old_pk, _new_pk) in _PK_UPGRADES.items():
+def _pk_upgrade_pending(conn: sqlite3.Connection) -> int | None:
+    """Shape-epoch of the first pending in-place PK upgrade, or None.
+
+    The returned epoch names the rollback snapshot
+    (.pre-epoch<shape-epoch>-pk-upgrade.bak): the schema generation whose PK
+    shape the pending upgrade INSTALLS, not necessarily the current
+    SCHEMA_EPOCH_USER_VERSION (issue #47 — a stamping-protocol bump changes
+    no PK shape and must not rename operator-facing rollback artifacts).
+    """
+    for table, (old_pk, _new_pk, shape_epoch) in _PK_UPGRADES.items():
         if not _table_exists(conn, table) or not _is_scoped(conn, table):
             continue
         if _pk_cols(conn, table) == ["scope"] + old_pk:
-            return True
-    return False
+            return shape_epoch
+    return None
 
 
 def _ensure_epoch_backup(db_path: Path, epoch: int) -> Path | None:
@@ -506,8 +598,9 @@ def migrate_db_open(db_path: str | Path, conn: sqlite3.Connection,
     # for this upgrade. Same idempotence rule: never overwrite an existing
     # snapshot. (The scoped-shape check needs the caller's connection; the
     # snapshot itself uses the backup API against the file.)
-    if str(path) != ":memory:" and _pk_upgrade_pending(conn):
-        _ensure_epoch_backup(path, SCHEMA_EPOCH_USER_VERSION)
+    pending_epoch = _pk_upgrade_pending(conn)
+    if str(path) != ":memory:" and pending_epoch is not None:
+        _ensure_epoch_backup(path, pending_epoch)
     return migrate_scoped_db(conn, stamp=stamp)
 
 
@@ -528,8 +621,9 @@ def migrate_file(db_path: str | Path, stamp: str = DEFAULT_STAMP,
     try:
         # Epoch-upgrade snapshot (issue #44) — same policy as the auto path:
         # one-time, never overwrites, taken only when a PK rebuild is pending.
-        if backup and _pk_upgrade_pending(conn):
-            _ensure_epoch_backup(path, SCHEMA_EPOCH_USER_VERSION)
+        pending_epoch = _pk_upgrade_pending(conn)
+        if backup and pending_epoch is not None:
+            _ensure_epoch_backup(path, pending_epoch)
         report = migrate_scoped_db(conn, stamp=stamp)
         conn.commit()
         # WAL may hold the migration in -wal; checkpoint so the main file
@@ -570,7 +664,7 @@ def main(argv: list[str] | None = None) -> int:
             # Epoch PK-shape upgrades (issue #44): already-scoped tables whose
             # PK predates the current spec (rebuilt in place, rows preserved).
             pk_pending = {}
-            for t, (old_pk, new_pk) in _PK_UPGRADES.items():
+            for t, (old_pk, new_pk, _shape_epoch) in _PK_UPGRADES.items():
                 if t not in existing or not _is_scoped(conn, t):
                     continue
                 cur = _pk_cols(conn, t)
