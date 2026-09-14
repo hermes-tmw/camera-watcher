@@ -1,0 +1,64 @@
+# watcher.cfg.example — committed template for the git-ignored etc/watcher.cfg.
+#
+# WHY THIS EXISTS: every watcher Dockerfile does `COPY ./etc/watcher.cfg`, but
+# the real file is git-ignored (it carries the live DB password and weather API
+# key). A clean clone therefore could not even run `docker compose build`, and
+# `hermes verify` could never pass. The Dockerfiles now fall back to THIS file
+# when the real one is absent, and the verify recipe points WATCHER_CONFIG at
+# it for the test phase.
+#
+# OPERATOR SETUP: copy to etc/watcher.cfg and fill in real values —
+#     cp etc/watcher.cfg.example etc/watcher.cfg
+# The real file is git-ignored and never committed (a live credential was once
+# leaked this way — see watcher/tests/utils.py). Runtime containers bind-mount
+# ./etc over /usr/local/etc (compose.yaml), so the baked-in copy only matters
+# at build time.
+
+[database]
+DB_NAME=watcher
+DB_USER=watcher
+# Real password lives only in the git-ignored etc/watcher.cfg.
+DB_PASS=CHANGE_ME
+DB_HOST=localhost
+DB_DRIVER=postgresql+psycopg2
+
+# Alternative: file-based SQLite (no Postgres required)
+#DB_NAME=/data/watcher.sqlite3
+#DB_DRIVER=sqlite+pysqlite
+
+[system]
+BASE_APP_PUBLIC_URL=http://localhost/watcher
+BASE_STATIC_PUBLIC_URL=http://localhost
+LOCAL_DATA_DIR=/data/video/watcher
+
+# redis service name from compose.yaml (use localhost for bare-metal runs)
+REDIS_HOST=redis
+
+[log]
+LEVEL=INFO
+FILE=log/watcher.log
+
+[location]
+# Home coordinates are operator-private; the live config carries real values.
+LATITUDE=0.0
+LONGITUDE=0.0
+# in feet
+ELEVATION=0
+TIMEZONE=US/Mountain
+
+[video]
+MAX_FRAMES_PER_CHUNK=100
+
+[weather]
+# OpenWeatherMap API key — real value only in the git-ignored config.
+API_KEY=CHANGE_ME
+
+[prediction]
+# Legacy fastai still-model; leave pointing anywhere valid-looking when the
+# predictor stack is unused (ollama classification replaced it).
+STILL_MODEL_FILE=/usr/local/etc/model.pkl
+
+[classification]
+# Ollama API endpoint. In Docker use http://host.docker.internal:11434
+OLLAMA_HOST=http://localhost:11434
+MODEL=llama3.2-vision:latest

@@ -28,6 +28,9 @@ services:
       dockerfile: Dockerfile-io
       args:
         GIT_VERSION: ${GIT_VERSION:-}
+    # Pin the image tag: Dockerfile-video does `FROM camera-watcher-io`, so the
+    # tag must exist regardless of the compose project (directory) name.
+    image: camera-watcher-io
     command: ./watchutil.py ioworker
     user: "0:44"
     depends_on:
