@@ -1,11 +1,12 @@
 # watcher.cfg.example — committed template for the git-ignored etc/watcher.cfg.
 #
-# WHY THIS EXISTS: every watcher Dockerfile does `COPY ./etc/watcher.cfg`, but
-# the real file is git-ignored (it carries the live DB password and weather API
-# key). A clean clone therefore could not even run `docker compose build`, and
-# `hermes verify` could never pass. The Dockerfiles now fall back to THIS file
-# when the real one is absent, and the verify recipe points WATCHER_CONFIG at
-# it for the test phase.
+# WHY THIS EXISTS: the config-baking watcher Dockerfiles (api, classifier,
+# io, video) do `COPY ./etc/watcher.cfg*`, but the real file is git-ignored
+# (it carries the live DB password and weather API key). A clean clone
+# therefore could not even run `docker compose build`, and `hermes verify`
+# could never pass. Those Dockerfiles now fall back to THIS file when the
+# real one is absent (motion and stealthcam never bake a config), and the
+# verify recipe points WATCHER_CONFIG at it for the test phase.
 #
 # OPERATOR SETUP: copy to etc/watcher.cfg and fill in real values —
 #     cp etc/watcher.cfg.example etc/watcher.cfg
