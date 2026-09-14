@@ -113,6 +113,22 @@ class Config:
     dashboard_base_static_url: str = "http://mira.local"
     dashboard_local_data_dir: str = "/data/video/watcher"
 
+    # Motion-ingestor adapter (wichita scope). Polls the camera-watcher
+    # Postgres `event_observations` table for the motion camera's events and
+    # feeds the shared entity-memory engine under scope='wichita'. An empty
+    # event_scenes list means "ingestor disabled" (the taylor_hill worker
+    # leaves it empty; the wichita service sets it).
+    event_scenes: list = field(default_factory=lambda: [])
+    event_poll_seconds: int = 300
+    event_backlog_max: int = 200
+
+    # Geometric road band for fixed cameras (fractions of frame; see
+    # context.resolve_region_geom). Applied when a scope's region policy is
+    # "geometry" (wichita) rather than per-bearing mapping (taylor_hill).
+    road_band_y_max: float = 0.42
+    road_band_x_min: float = 0.30
+    road_band_x_max: float = 0.52
+
     # Per-location scope (2026-09-13 refactor): which location this process
     # serves. The Memory engine keys every table row on this scope, so two
     # sites sharing one DB never leak identity/state across each other.
@@ -150,6 +166,14 @@ class Config:
         "reid_similarity_threshold",
         "reid_model",
         "describer_model",
+        # fixed-camera (wichita) ingestor keys:
+        "event_scenes",
+        "event_poll_seconds",
+        "event_backlog_max",
+        "road_band_y_max",
+        "road_band_x_min",
+        "road_band_x_max",
+        "road_band_edge",
     )
 
     def __post_init__(self):

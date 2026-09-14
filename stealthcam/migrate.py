@@ -373,7 +373,8 @@ def _ensure_backup(db_path: Path, backup_dir: str | None = None) -> Path | None:
 
 def migrate_db_open(db_path: str | Path, conn: sqlite3.Connection,
                     stamp: str = DEFAULT_STAMP,
-                    backup_dir: str | None = None) -> dict:
+                    backup_dir: str | None = None,
+                    db_is_new: bool = False) -> dict:
     """Migration entry point for the Memory-open (deploy auto-migration) path.
 
     Takes the same one-time ``.pre-scope-migration.bak`` snapshot the CLI
@@ -382,10 +383,14 @@ def migrate_db_open(db_path: str | Path, conn: sqlite3.Connection,
 
     Backup is skipped when the DB file does not exist yet (Memory creating a
     fresh DB — nothing pre-migration exists to roll back) or is ``:memory:``
-    (dies with the process anyway).
+    (dies with the process anyway). ``db_is_new`` is the caller's direct
+    knowledge that THIS open created the file: Memory enables WAL before
+    migrating (multi-writer readiness), and the WAL pragma materializes a
+    real header on the previously-not-existing file, which would defeat the
+    0-byte freshness heuristic — so the constructor states "new" explicitly.
     """
     path = Path(db_path)
-    if str(path) != ":memory:":
+    if str(path) != ":memory:" and not db_is_new:
         _ensure_backup(path, backup_dir)
     return migrate_scoped_db(conn, stamp=stamp)
 
