@@ -156,6 +156,13 @@ CREATE TABLE IF NOT EXISTS entity_presence (
     ts REAL NOT NULL,
     PRIMARY KEY (scope, entity_id, direction, guid)
 );
+-- Denominator rows are REGION-TAGGED and keyed per region (issue #44,
+-- Percy PR#43 P2-4): a frame that evidences both road and driveway
+-- contributes ONE row per region (PK includes region), and
+-- presence_ratio() counts only its own region's rows — road traffic can
+-- no longer dilute the driveway denominator. ``region`` stays nullable in
+-- DDL for legacy-row compatibility (see migrate.py); the WRITE api
+-- (record_monitored) rejects unattributed rows loudly.
 CREATE TABLE IF NOT EXISTS monitored_captures (
     scope TEXT NOT NULL,
     direction TEXT NOT NULL,
@@ -164,7 +171,7 @@ CREATE TABLE IF NOT EXISTS monitored_captures (
     captured_at TEXT NOT NULL,
     ts REAL NOT NULL,
     is_day INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (scope, direction, guid)
+    PRIMARY KEY (scope, direction, region, guid)
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_scope_guid
     ON decisions (scope, guid);
@@ -172,6 +179,8 @@ CREATE INDEX IF NOT EXISTS idx_entity_presence_scope_ts
     ON entity_presence (scope, entity_id, direction, ts);
 CREATE INDEX IF NOT EXISTS idx_monitored_scope_ts
     ON monitored_captures (scope, ts, is_day);
+CREATE INDEX IF NOT EXISTS idx_monitored_scope_dir_region_ts
+    ON monitored_captures (scope, direction, region, ts, is_day);
 CREATE INDEX IF NOT EXISTS idx_memory_obs_scope_dir
     ON memory_observations (scope, direction);
 """
@@ -569,11 +578,33 @@ class Memory:
         """Record that capture `guid` was monitored at `direction` (denominator
         of the presence baseline), regardless of whether anything was detected.
 
+        ``region`` tags WHICH region's denominator this capture contributes
+        to; the presence baseline counts only same-region rows (issue #44,
+        Percy PR#43 P2-4 — the denominator was region-blind, so road
+        pass-bys diluted the driveway expectedness ratio). A capture that
+        evidences both regions gets one row per region — the caller writes
+        each explicitly. ``None``/unattributed regions are rejected loudly:
+        a silently-dropped row deflates the denominator (stretches presence
+        ratios toward "familiar"), while an unattributed row would re-open
+        the region-blindness defect.
+
         ``is_day`` marks whether the capture falls in the configured day window;
         the presence denominator counts DAY captures only, so night captures
         (whose numerator the night confidence gate mostly removes) do not drag
         a familiar vehicle's presence ratio permanently under threshold.
         """
+        if not region:
+            raise ValueError(
+                "record_monitored requires an attributed region "
+                "('driveway'/'road' per the scope's region policy); "
+                "region=None would silently re-open the region-blind "
+                "denominator (issue #44). Callers that genuinely have no "
+                "region policy must not seed the denominator at all.")
+        if region not in ("driveway", "road"):
+            raise ValueError(
+                f"record_monitored: unknown region {region!r} — expected "
+                "'driveway' or 'road' (per the scope's region policy); a "
+                "typo here would fork the denominator into a dead region.")
         ts = _ts(captured_at)
         self._conn.execute(
             "INSERT OR IGNORE INTO monitored_captures "
@@ -585,9 +616,26 @@ class Memory:
         self._conn.commit()
 
     def presence_ratio(self, entity_id: str, direction: str,
-                       now: str) -> float:
+                       now: str, *,
+                       region: str | None = None) -> float:
         """Fraction of monitored DAY captures (rolling window) the entity appeared
-        at `direction`. 0.0 when there is no monitored day history yet."""
+        at `direction`. 0.0 when there is no monitored day history yet.
+
+        ``region`` (issue #44, Percy PR#43 P2-4): the denominator is counted
+        PER REGION — a driveway entity's ratio must not be diluted by road
+        pass-by rows. Required in practice: without a region the count
+        silently mixes denominators (the region-blind defect), so omitting
+        it is rejected loudly instead of guessing.
+        """
+        if not region:
+            raise ValueError(
+                "presence_ratio requires region= ('driveway'/'road') — the "
+                "denominator is per-region; a regionless count silently "
+                "mixes road and driveway captures (issue #44).")
+        if region not in ("driveway", "road"):
+            raise ValueError(
+                f"presence_ratio: unknown region {region!r} — expected "
+                "'driveway' or 'road'.")
         cutoff = _ts(now) - self.entity_baseline_window_days * 86400.0
         num_pres = self._conn.execute(
             "SELECT COUNT(*) FROM entity_presence "
@@ -596,8 +644,9 @@ class Memory:
         ).fetchone()[0]
         num_mon = self._conn.execute(
             "SELECT COUNT(*) FROM monitored_captures "
-            "WHERE scope = ? AND direction = ? AND ts >= ? AND is_day = 1",
-            (self.scope, direction, cutoff),
+            "WHERE scope = ? AND direction = ? AND region = ? "
+            "AND ts >= ? AND is_day = 1",
+            (self.scope, direction, region, cutoff),
         ).fetchone()[0]
         if num_mon == 0:
             return 0.0
@@ -715,7 +764,7 @@ class Memory:
             self.record_presence(entity_id, direction, key, now)
             return self._evaluate_expectedness(
                 entity_id, direction, cls, now, attr_text, capture_count,
-                prior_last_ts)
+                prior_last_ts, region=region)
 
         # Unclassified region -> current novel-vehicle policy.
         if is_static:
@@ -727,7 +776,8 @@ class Memory:
     def _evaluate_expectedness(self, entity_id: str, direction: str, cls: str,
                                now: str, attr_text: str,
                                capture_count: int,
-                               prior_last_ts: float | None = None) -> Decision:
+                               prior_last_ts: float | None = None,
+                               region: str | None = None) -> Decision:
         """Apply presence-ratio + hysteresis to decide expected vs unfamiliar.
 
         Hysteresis (P1-1): once an entity is "expected" it STAYS expected across
@@ -735,6 +785,10 @@ class Memory:
         only reverts to unfamiliar after being absent for >=
         ``entity_expected_absence_days``. Without this, a familiar vehicle at
         ~threshold presence flips between alert/note on every minor miss.
+
+        ``region`` routes the presence-ratio DENOMINATOR (issue #44): a
+        driveway entity's expectedness is computed against same-region
+        monitored rows only, never against the road pass-by volume.
         """
         already_expected = self._entity_expected(entity_id)
 
@@ -746,14 +800,14 @@ class Memory:
             if absent_days < self.entity_expected_absence_days:
                 return Decision(
                     NOTE,
-                    f"expected vehicle ({cls}, presence {self.presence_ratio(entity_id, direction, now):.0%})",
+                    f"expected vehicle ({cls}, presence {self.presence_ratio(entity_id, direction, now, region=region):.0%})",
                     capture_count, False, entity_id=entity_id,
                     tag=TAG_BACKGROUND, attributes_text=attr_text,
                 )
             # Absent long enough -> drop expected, fall through to ratio check.
             self._set_entity_expected(entity_id, False)
 
-        ratio = self.presence_ratio(entity_id, direction, now)
+        ratio = self.presence_ratio(entity_id, direction, now, region=region)
         if ratio >= self.entity_expected_presence_ratio:
             self._set_entity_expected(entity_id, True)
             return Decision(

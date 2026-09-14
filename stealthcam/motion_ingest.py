@@ -269,9 +269,18 @@ def process_event(event: MotionEvent, detector: Detector,
     attributes: dict[int, VehicleAttributes] = {}
     fingerprints: dict[int, bytes] = {}
 
-    # Denominator region: "road" when any road-band detection exists, else the
-    # property default. Every processed event frame is a monitored capture.
-    monitored_region = "driveway"
+    # Denominator regions EVIDENCED by this frame (issue #44, Percy PR#43
+    # P2-4): each detection's own region contributes its denominator row, so
+    # a frame showing both road traffic AND a driveway vehicle feeds BOTH
+    # denominators — the old single-`monitored_region` attribution sent the
+    # whole frame to 'road', losing genuine driveway denominator rows and
+    # letting road traffic volume silently retune the driveway expectedness
+    # threshold. Near-band (road_edge) counts toward the road denominator
+    # (P2-3: near-band captures are pass-by evidence, not property presence —
+    # a pass-by miscounted as a driveway capture manufactures unfamiliar
+    # alerts). With NO surviving detection the frame still defaults to the
+    # property region: every processed frame is a monitored capture (#43).
+    monitored_regions = {"driveway"}
     alert_dets = []
     for i, det in enumerate(detections):
         x1, y1, x2, y2 = [float(v) for v in det.bbox]
@@ -287,12 +296,7 @@ def process_event(event: MotionEvent, detector: Detector,
                         event.event_name, i, det.bbox)
             continue
         if region in ("road", "road_edge"):
-            # Near-band captures count toward the road (pass-by) denominator,
-            # not the driveway one: a road pass-by miscounted as a driveway
-            # monitored capture deflates presence ratios and manufactures
-            # unfamiliar-vehicle alerts. (P2-4 tracks the wider region-blind
-            # denominator issue.)
-            monitored_region = "road"
+            monitored_regions.add("road")
 
         if det.category == "vehicle":
             try:
@@ -357,9 +361,10 @@ def process_event(event: MotionEvent, detector: Detector,
                 log.error("dashboard labeling %s det %d failed: %s",
                           event.event_name, i, e)
 
-    memory.record_monitored(event.scene_name, monitored_region,
-                            event.event_name, event.capture_iso,
-                            is_day=not night)
+    for region in sorted(monitored_regions):
+        memory.record_monitored(event.scene_name, region,
+                                event.event_name, event.capture_iso,
+                                is_day=not night)
 
     if alert_dets and not baseline_mode:
         alert_detections = [detections[i] for i, _, _ in alert_dets]

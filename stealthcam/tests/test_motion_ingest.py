@@ -739,12 +739,61 @@ class TestProcessEventRunner(unittest.TestCase):
         road_car = _mk_detection("car", 0.72, (500.0, 259.0, 576.0, 288.0))
         m, s = self._run([road_car])
         conn = sqlite3.connect(self.db)
-        region = conn.execute(
+        regions = {r[0] for r in conn.execute(
             "SELECT region FROM monitored_captures WHERE scope='wichita'"
-        ).fetchone()[0]
-        self.assertEqual(region, "road")
+        ).fetchall()}
+        self.assertIn("road", regions)
         conn.close()
         m.close()
+
+    def test_road_only_frame_still_counts_driveway_denominator(self):
+        """Issue #44 core shape: a frame whose only detections are road-band
+        pass-bys must STILL contribute the driveway denominator row — under
+        the old single-region attribution the whole frame went to 'road' and
+        genuine driveway denominator rows were lost."""
+        road_car = _mk_detection("car", 0.72, (500.0, 259.0, 576.0, 288.0))
+        m, s = self._run([road_car])
+        conn = sqlite3.connect(self.db)
+        rows = conn.execute(
+            "SELECT region, guid, is_day FROM monitored_captures "
+            "WHERE scope='wichita'").fetchall()
+        conn.close()
+        m.close()
+        self.assertEqual({r for r, _, _ in rows}, {"driveway", "road"},
+                         "road-only frame must feed BOTH denominators")
+        self.assertEqual(len({g for _, g, _ in rows}), 1,
+                         "one frame = one guid, one row per region")
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(d == 1 for _, _, d in rows))
+
+    def test_both_regions_frame_contributes_to_both_denominators(self):
+        """THE issue #44 frame: road pass-by AND a driveway vehicle in the
+        same frame. The old code attributed the whole frame to 'road',
+        dropping the driveway denominator row; both regions must be counted."""
+        road_car = _mk_detection("car", 0.72, (500.0, 259.0, 576.0, 288.0))
+        drive_car = _mk_detection("car", 0.80, (100.0, 400.0, 300.0, 600.0))
+        m, s = self._run([road_car, drive_car])
+        conn = sqlite3.connect(self.db)
+        rows = conn.execute(
+            "SELECT region, guid FROM monitored_captures "
+            "WHERE scope='wichita'").fetchall()
+        conn.close()
+        m.close()
+        self.assertEqual(sorted(r for r, _ in rows), ["driveway", "road"])
+        self.assertEqual(len({g for _, g in rows}), 1,
+                         "both rows belong to the same event frame guid")
+
+    def test_driveway_only_frame_single_row(self):
+        drive_car = _mk_detection("car", 0.80, (100.0, 400.0, 300.0, 600.0))
+        m, s = self._run([drive_car])
+        conn = sqlite3.connect(self.db)
+        rows = conn.execute(
+            "SELECT region FROM monitored_captures "
+            "WHERE scope='wichita'").fetchall()
+        conn.close()
+        m.close()
+        self.assertEqual([r for (r,) in rows], ["driveway"],
+                         "no road detection -> no road denominator row")
 
     def test_degenerate_bbox_skipped_loudly(self):
         bad = _mk_detection("car", 0.9, (300.0, 300.0, 300.0, 300.0))
