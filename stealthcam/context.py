@@ -120,7 +120,9 @@ def resolve_region_geom(bbox_frac: tuple[float, float, float, float],
     and above ``road_y_max`` vertically. Detections whose center-y sits
     within ``road_edge`` of the cutoff — inside the x-band — resolve to
     "road_edge" (near-band: the caller FLAGs these for human review instead
-    of trusting the edge). Everything else resolves to ``driveway`` (the
+    of trusting the edge; the boundary is inclusive, compared at 1e-9
+    precision so binary-float wobble exactly at the edge can't flip the
+    classification). Everything else resolves to ``driveway`` (the
     fixed camera watches the property; a vehicle anywhere off the road band
     is on the property). Vehicles are the only category the caller routes by
     region, but the function is category-agnostic.
@@ -136,7 +138,14 @@ def resolve_region_geom(bbox_frac: tuple[float, float, float, float],
     cy = (y1 + y2) / 2.0
     if not (road_x_min <= cx <= road_x_max):
         return "driveway"
-    if abs(cy - road_y_max) <= road_edge:
+    # round() the *difference* to 1e-9: cy=0.44 vs y_max=0.42 computes
+    # abs() = 0.020000000000000018 — 1 ulp above road_edge=0.02 — which
+    # would push a detection sitting exactly on the +edge OUT of the zone
+    # (Percy PR#43 round-2). Snapping at 1e-9 keeps the documented inclusive
+    # boundary while staying ~6 orders of magnitude tighter than the
+    # smallest real-world cohort margin (>=0.015), so genuine excursions
+    # (edge + 1e-6 and up) are unaffected.
+    if abs(round(cy - road_y_max, 9)) <= road_edge:
         # Straddles the cutoff (e.g. a pass-by shifted by night IR optics, or
         # a vehicle entering through the gate gap). Flag, don't guess.
         return "road_edge"

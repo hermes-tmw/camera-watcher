@@ -92,6 +92,29 @@ class TestResolveRegionGeom(unittest.TestCase):
         self.assertEqual(
             resolve_region_geom((0.36, 0.39, 0.46, 0.43)), "road_edge")
 
+    def test_exact_edge_boundary_is_inclusive_both_sides(self):
+        # Percy PR#43 round-2: cy exactly at y_max + road_edge must land in
+        # the flag zone. cy=0.44 computes abs(0.44-0.42) as
+        # 0.020000000000000018 — 1 ulp ABOVE road_edge=0.02 — which pushed
+        # the +edge boundary OUT of the zone under the raw comparison (the
+        # -edge side rounded the other way and always passed). Both sides
+        # are pinned inclusive here.
+        self.assertEqual(
+            resolve_region_geom((0.36, 0.42, 0.46, 0.46)),  # cy == 0.44
+            "road_edge")  # y_max + edge
+        self.assertEqual(
+            resolve_region_geom((0.36, 0.38, 0.46, 0.42)),  # cy == 0.40
+            "road_edge")  # y_max - edge
+
+    def test_edge_epsilon_does_not_widen_the_zone(self):
+        # The 1e-9 boundary snap must not become a fudge factor: a genuine
+        # excursion past the edge (edge + 1e-6, ~6 orders of magnitude above
+        # float wobble but still far under any real cohort margin) stays
+        # OUT of the flag zone.
+        self.assertEqual(
+            resolve_region_geom((0.36, 0.42, 0.46, 0.46 + 2e-6)),
+            "driveway")
+
     def test_measured_cohorts_clear_the_edge_zone(self):
         # Night re-measure (t_f1b4349d, 2,230-frame sample): road pass-bys
         # cy 0.3695-0.385 — >=0.035 above the cutoff, so real pass-bys are
@@ -442,7 +465,7 @@ class TestMotionEventSource(unittest.TestCase):
         self.assertIn("ORDER BY e.capture_time ASC", sql)
         # P0-1: NO SQL LIMIT — the 12h window is the bound; the seen-filter
         # runs in python and the new-work cap is applied AFTER it.
-        self.assertNotIn("LIMIT", sql.upper().replace("LIMIT 200", ""))
+        self.assertNotIn("LIMIT", sql.upper())
         self.assertNotRegex(sql, r"LIMIT\s+%")
         self.assertEqual(captured["params"]["scenes"], ["WichitaDriveway"])
         self.assertNotIn("limit", captured["params"])
