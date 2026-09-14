@@ -24,4 +24,8 @@ COPY watcher watcher/
 ARG GIT_VERSION=unknown
 RUN echo $GIT_VERSION > VERSION
 
-COPY ./etc/watcher.cfg /usr/local/etc/watcher.cfg
+# Build-time config: prefer the operator's real etc/watcher.cfg; when absent
+# (it is git-ignored) bake the committed example instead. Runtime reads the
+# ./etc bind-mount, not this baked copy.
+COPY ./etc/watcher.cfg* /usr/local/etc/
+RUN [ -f /usr/local/etc/watcher.cfg ] || { cp /usr/local/etc/watcher.cfg.example /usr/local/etc/watcher.cfg && echo "watcher.cfg: example in use (operators: create etc/watcher.cfg for real settings)"; }

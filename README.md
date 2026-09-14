@@ -14,6 +14,33 @@ docker compose build
 docker compose up
 ```
 
+### Operator configuration
+
+`etc/watcher.cfg` is git-ignored (it carries the live DB password and API
+keys). Copy the committed template and fill in real values:
+
+```
+cp etc/watcher.cfg.example etc/watcher.cfg
+```
+
+At build time the Dockerfiles bake `etc/watcher.cfg` when present and fall
+back to `etc/watcher.cfg.example` otherwise, so a clean clone always builds.
+At runtime every service bind-mounts `./etc` over `/usr/local/etc`, so the
+file the containers actually read is your local `etc/watcher.cfg`.
+
+### Machine verification
+
+`make build` builds every service image (io first — Dockerfile-video derives
+from its `camera-watcher-io` tag), `make test` runs the stealthcam test suite
+(140 tests, stdlib unittest) against the committed example config. There is
+deliberately no `make run`/`start` target: `docker compose up` boots real
+workers against the production database.
+
+`hermes verify` detects this Makefile and runs build → test (no start phase).
+It passes on a clean clone with no local-only files. On hosts that also run
+the live stack, use `hermes verify --skip-start` if a start phase is ever
+added; today the recipe has none by design.
+
 ## Training data
 
 [Note: not maintained] The first task of this project is to collect training labels of the video clips. An [iPhone app](https://github.com/tomwhipple/camera-trainer) was developed which uses this framework to store results.
