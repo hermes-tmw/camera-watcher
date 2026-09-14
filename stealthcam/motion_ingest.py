@@ -62,7 +62,7 @@ from .describer import Describer, VehicleAttributes
 from .detector import Detector
 from .memory import Memory, ALERT, FLAG, NOTE, SUPPRESS
 from .notify import Notifier
-from .context import is_night, resolve_region_geom
+from .context import is_night, resolve_region_geom, ROAD_DEFAULT_EDGE
 
 log = logging.getLogger("stealthcam.motion_ingest")
 
@@ -280,12 +280,18 @@ def process_event(event: MotionEvent, detector: Detector,
             bbox_frac,
             road_y_max=road.get("y_max", 0.42),
             road_x_min=road.get("x_min", 0.30),
-            road_x_max=road.get("x_max", 0.52))
+            road_x_max=road.get("x_max", 0.52),
+            road_edge=road.get("edge", ROAD_DEFAULT_EDGE))
         if region is None:
             log.warning("event %s det %d: degenerate bbox %s skipped",
                         event.event_name, i, det.bbox)
             continue
-        if region == "road":
+        if region in ("road", "road_edge"):
+            # Near-band captures count toward the road (pass-by) denominator,
+            # not the driveway one: a road pass-by miscounted as a driveway
+            # monitored capture deflates presence ratios and manufactures
+            # unfamiliar-vehicle alerts. (P2-4 tracks the wider region-blind
+            # denominator issue.)
             monitored_region = "road"
 
         if det.category == "vehicle":
@@ -331,9 +337,12 @@ def process_event(event: MotionEvent, detector: Detector,
 
         # Dashboard: a labeling row on the EXISTING event row (one card per
         # motion event; description carries the [tag]). Suppressed background
-        # stays off the dashboard (GH#8 parity with the taylor worker).
+        # stays off the dashboard (GH#8 parity with the taylor worker). FLAG
+        # gets a row too: a near-band (road_edge) flag exists precisely so a
+        # human reviews it — a flag visible only in the decisions table is a
+        # silent path (FLAG never posts to Mattermost, by policy).
         if (not baseline_mode and dashboard is not None
-                and decision.decision in (NOTE, ALERT)):
+                and decision.decision in (NOTE, ALERT, FLAG)):
             text = decision.reason
             if decision.attributes_text:
                 text = f"{text} — {decision.attributes_text}"
@@ -384,6 +393,8 @@ def _road_band(cfg) -> dict:
         "y_max": float(cfg.scope_setting(scope, "road_band_y_max", 0.42)),
         "x_min": float(cfg.scope_setting(scope, "road_band_x_min", 0.30)),
         "x_max": float(cfg.scope_setting(scope, "road_band_x_max", 0.52)),
+        "edge": float(cfg.scope_setting(scope, "road_band_edge",
+                                        ROAD_DEFAULT_EDGE)),
     }
 
 

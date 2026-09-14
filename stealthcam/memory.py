@@ -621,7 +621,8 @@ class Memory:
         Entity-memory additions (all keyword-only, backward compatible):
 
         - ``fingerprint`` — the re-id bytes for a vehicle crop (identity key).
-        - ``region``     — the resolved spatial region ("driveway"/"road"/None).
+        - ``region``     — the resolved spatial region ("driveway"/"road"/
+          "road_edge"/None; road_edge = near the road-band edge, FLAGged).
         - ``attributes`` — a VehicleAttributes (make/model/lettering).
         - ``guid``       — the capture guid, used to dedupe presence/monitored
           rows (falls back to ``now`` when absent).
@@ -688,6 +689,15 @@ class Memory:
             # Pass-by: note only, no alert (still capture make/model + lettering).
             return Decision(NOTE, f"vehicle pass-by ({cls})", capture_count, False,
                             tag=TAG_TRAFFIC, attributes_text=attr_text)
+
+        if region == "road_edge":
+            # Near-band (Percy PR#43 P2-3): the geometry is not confident the
+            # detection is road vs property — a firm road NOTE risks a silent
+            # missed visitor (driveway->road), a firm driveway ALERT risks a
+            # noisy pass-by alert (road->driveway). FLAG for human review
+            # instead; dashboard-only (FLAG never posts to Mattermost).
+            return Decision(FLAG, f"vehicle near road band ({cls})", capture_count,
+                            False, tag=TAG_TRAFFIC, attributes_text=attr_text)
 
         if region == "driveway":
             # Identity-expectedness evaluation.

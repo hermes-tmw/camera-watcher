@@ -69,12 +69,48 @@ class TestResolveRegionGeom(unittest.TestCase):
         self.assertEqual(resolve_region_geom((0.0, 0.42, 0.09, 0.84)),
                          "driveway")
 
-    def test_center_y_at_cutoff_is_driveway(self):
-        # cy == road_y_max is NOT road (strictly-above rule)
+    def test_center_y_at_cutoff_is_road_edge(self):
+        # cy == road_y_max inside the x-band is the NEAR-BAND flag zone
+        # (P2-3): not a firm driveway — the geometry is ambiguous exactly at
+        # the edge, so it FLAGs for human review instead of guessing.
         cy = ROAD_DEFAULT_Y_MAX
         self.assertEqual(
             resolve_region_geom((0.35, cy - 0.02, 0.45, cy + 0.02)),
-            "driveway")
+            "road_edge")
+
+    def test_road_edge_zone_below_cutoff(self):
+        # cy 0.435 inside the x-band (a vehicle entering through the gate
+        # gap, or a pass-by shifted down): within the 0.02 margin below the
+        # cutoff -> flag zone, not a firm driveway.
+        self.assertEqual(
+            resolve_region_geom((0.36, 0.41, 0.46, 0.46)), "road_edge")
+
+    def test_road_edge_zone_is_two_sided(self):
+        # A pass-by shifted DOWN below the cutoff (night IR scale shift)
+        # lands cy 0.405-0.415 — still inside the flag zone, still not a
+        # firm road NOTE (which would silently hide a property vehicle).
+        self.assertEqual(
+            resolve_region_geom((0.36, 0.39, 0.46, 0.43)), "road_edge")
+
+    def test_measured_cohorts_clear_the_edge_zone(self):
+        # Night re-measure (t_f1b4349d, 2,230-frame sample): road pass-bys
+        # cy 0.3695-0.385 — >=0.035 above the cutoff, so real pass-bys are
+        # NOT flagged. Truck (cx 0.64-0.67) stays outside the x-band.
+        self.assertEqual(resolve_region_geom((0.39, 0.36, 0.46, 0.41)),
+                         "road")  # worst-case night pass-by cy=0.385
+        self.assertEqual(resolve_region_geom((0.62, 0.40, 0.72, 0.49)),
+                         "driveway")  # parked truck night: cx~0.67 cy~0.44
+
+    def test_road_edge_margin_is_configurable(self):
+        # edge=0 restores the old hard cutoff; a wider margin widens the
+        # flag zone. Same bbox, three margins.
+        bbox = (0.36, 0.41, 0.46, 0.46)  # cy = 0.435
+        self.assertEqual(
+            resolve_region_geom(bbox, road_edge=0.0), "driveway")
+        self.assertEqual(
+            resolve_region_geom(bbox, road_edge=0.02), "road_edge")
+        self.assertEqual(
+            resolve_region_geom(bbox, road_edge=0.05), "road_edge")
 
     def test_x_band_edges(self):
         # inside the band horizontally but low in the frame -> driveway
@@ -150,6 +186,54 @@ class TestWichitaEnginePolicy(unittest.TestCase):
         d = m.decide("WichitaDriveway", "car", (550.0, 260.0, 780.0, 380.0),
                      now=_iso(_T0), fingerprint=None, region="driveway",
                      guid="ev-3")
+        self.assertEqual(d.decision, "alert")
+        m.close()
+
+    def test_near_band_vehicle_flags_not_alert_or_note(self):
+        # Percy PR#43 P2-3 item 1: a near-band (road_edge) vehicle is
+        # geometry-ambiguous -> FLAG for human review, never a firm
+        # NOTE (silent missed visitor) or ALERT (noisy pass-by).
+        m = _mk(self.db, "wichita")
+        d = m.decide("WichitaDriveway", "car", (460.0, 300.0, 590.0, 330.0),
+                     now=_iso(_T0), fingerprint=b"edge-car",
+                     region="road_edge", guid="ev-edge-1")
+        self.assertEqual(d.decision, "flag")
+        self.assertEqual(d.tag, "traffic")
+        self.assertFalse(d.is_alert)
+        m.close()
+
+    # Person-in-road intent (P2-3 item 2, Tom-confirmed 2026-09-13): the
+    # person policy is deliberately REGION-BLIND — a person near the property
+    # edge (Wichita Rd included) is worth an alert regardless of region. The
+    # tests below codify that intent so a future region-gating refactor fails
+    # loudly here first.
+
+    def test_person_in_road_band_alerts_region_blind(self):
+        m = _mk(self.db, "wichita")
+        d = m.decide("WichitaDriveway", "person",
+                     (460.0, 250.0, 500.0, 320.0),
+                     now=_iso(_T0), region="road", guid="ev-person-road")
+        self.assertEqual(d.decision, "alert")
+        self.assertEqual(d.reason, "person")
+        m.close()
+
+    def test_person_near_band_road_edge_still_alerts(self):
+        # road_edge is a VEHICLE-identity ambiguity, not a person policy: a
+        # person in the near-band zone still alerts (region-blind policy),
+        # NOT a flag — the flag path is vehicle-only by construction.
+        m = _mk(self.db, "wichita")
+        d = m.decide("WichitaDriveway", "person",
+                     (460.0, 260.0, 500.0, 330.0),
+                     now=_iso(_T0), region="road_edge",
+                     guid="ev-person-edge")
+        self.assertEqual(d.decision, "alert")
+        m.close()
+
+    def test_person_unclassified_region_still_alerts(self):
+        m = _mk(self.db, "wichita")
+        d = m.decide("WichitaDriveway", "person",
+                     (300.0, 400.0, 360.0, 480.0),
+                     now=_iso(_T0), region=None, guid="ev-person-none")
         self.assertEqual(d.decision, "alert")
         m.close()
 
@@ -668,6 +752,58 @@ class TestProcessEventRunner(unittest.TestCase):
         self.assertEqual(s["detections"], 0)
         m.close()
 
+    # -- near-band (road_edge) adapter wiring (Percy P2-3 item 1) ------------
+
+    def test_near_band_vehicle_flags_end_to_end(self):
+        # bbox center (555/1280=0.4337, 316/720=0.4389): inside the x-band,
+        # within the 0.02 margin below the 0.42 cutoff -> road_edge -> FLAG.
+        # Dashboard gets a row (flags exist so a human reviews them), no
+        # Mattermost post, and the capture counts toward the ROAD denominator
+        # (a road pass-by miscounted as driveway monitored-capture deflates
+        # presence ratios and manufactures unfamiliar alerts).
+        edge_car = _mk_detection("car", 0.7, (490.0, 280.0, 620.0, 352.0))
+        m, s = self._run([edge_car])
+        self.assertEqual(s["flags"], 1)
+        self.assertEqual(s["alerts"], 0)
+        self.assertEqual(s["notes"], 0)
+        self.assertEqual(self.notifier.alerts, [])  # FLAG never posts
+        self.assertEqual(len(self.dashboard.notes), 1)
+        text = self.dashboard.notes[0][3]
+        self.assertIn("near road band", text)
+        conn = sqlite3.connect(self.db)
+        region = conn.execute(
+            "SELECT region FROM monitored_captures WHERE scope='wichita'"
+        ).fetchone()[0]
+        self.assertEqual(region, "road")
+        conn.close()
+        m.close()
+
+    def test_road_edge_margin_config_flows_to_geometry(self):
+        # road_band_edge scope key widens/shrinks the flag zone at runtime.
+        import stealthcam.motion_ingest as mi
+        from stealthcam.config import Config
+        cfg = Config()
+        cfg.memory_scope = "wichita"
+        cfg.scopes = {"wichita": {"road_band_edge": 0.05}}
+        band = mi._road_band(cfg)
+        self.assertEqual(band["edge"], 0.05)
+        # default when unset
+        cfg2 = Config()
+        cfg2.memory_scope = "wichita"
+        cfg2.scopes = {"wichita": {}}
+        self.assertEqual(mi._road_band(cfg2)["edge"], 0.02)
+
+    def test_person_in_road_alerts_through_adapter(self):
+        # Person intent codified at the adapter level too: region comes back
+        # "road" from the geometry, decide() still ALERTs (region-blind
+        # person policy), Mattermost post fires with the "Human" label.
+        person = _mk_detection("person", 0.9, (470.0, 230.0, 510.0, 300.0))
+        m, s = self._run([person])
+        self.assertEqual(s["alerts"], 1)
+        self.assertEqual(len(self.notifier.alerts), 1)
+        self.assertIn("Human", self.notifier.alerts[0][0])
+        m.close()
+
 
 # -- 7. process_batch starvation + backfill drain (Percy P0-1 / P1-2) ----------
 
@@ -997,7 +1133,8 @@ class TestWichitaScopeConfig(unittest.TestCase):
         from stealthcam.config import Config
         cfg = Config()
         for key in ("event_scenes", "event_poll_seconds", "event_backlog_max",
-                    "road_band_y_max", "road_band_x_min", "road_band_x_max"):
+                    "road_band_y_max", "road_band_x_min", "road_band_x_max",
+                    "road_band_edge"):
             self.assertIn(key, cfg.SCOPE_KEYS)
 
     def test_typo_in_scope_block_raises(self):
@@ -1017,6 +1154,7 @@ class TestWichitaScopeConfig(unittest.TestCase):
         self.assertEqual(band["y_max"], 0.5)
         self.assertEqual(band["x_min"], 0.30)
         self.assertEqual(band["x_max"], 0.52)
+        self.assertEqual(band["edge"], 0.02)
 
 
 if __name__ == "__main__":

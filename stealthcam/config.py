@@ -173,6 +173,7 @@ class Config:
         "road_band_y_max",
         "road_band_x_min",
         "road_band_x_max",
+        "road_band_edge",
     )
 
     def __post_init__(self):
