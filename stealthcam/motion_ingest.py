@@ -270,17 +270,18 @@ def process_event(event: MotionEvent, detector: Detector,
     fingerprints: dict[int, bytes] = {}
 
     # Denominator regions EVIDENCED by this frame (issue #44, Percy PR#43
-    # P2-4): each detection's own region contributes its denominator row, so
-    # a frame showing both road traffic AND a driveway vehicle feeds BOTH
-    # denominators — the old single-`monitored_region` attribution sent the
-    # whole frame to 'road', losing genuine driveway denominator rows and
+    # P2-4): each surviving detection contributes ITS region's denominator
+    # row, so a frame showing both road traffic AND a driveway vehicle feeds
+    # BOTH denominators — the old single-`monitored_region` attribution sent
+    # the whole frame to 'road', losing genuine driveway denominator rows and
     # letting road traffic volume silently retune the driveway expectedness
     # threshold. Near-band (road_edge) counts toward the road denominator
     # (P2-3: near-band captures are pass-by evidence, not property presence —
     # a pass-by miscounted as a driveway capture manufactures unfamiliar
-    # alerts). With NO surviving detection the frame still defaults to the
-    # property region: every processed frame is a monitored capture (#43).
-    monitored_regions = {"driveway"}
+    # alerts). A frame with NO surviving detection still counts as a property
+    # monitored capture (#43: every processed frame is monitored) — that is
+    # the one case the property region is the default rather than evidenced.
+    monitored_regions: set[str] = set()
     alert_dets = []
     for i, det in enumerate(detections):
         x1, y1, x2, y2 = [float(v) for v in det.bbox]
@@ -297,6 +298,8 @@ def process_event(event: MotionEvent, detector: Detector,
             continue
         if region in ("road", "road_edge"):
             monitored_regions.add("road")
+        else:
+            monitored_regions.add("driveway")
 
         if det.category == "vehicle":
             try:
@@ -361,6 +364,10 @@ def process_event(event: MotionEvent, detector: Detector,
                 log.error("dashboard labeling %s det %d failed: %s",
                           event.event_name, i, e)
 
+    # No surviving detection -> the frame still counts as a property
+    # monitored capture (#43: every processed frame is monitored).
+    if not monitored_regions:
+        monitored_regions.add("driveway")
     for region in sorted(monitored_regions):
         memory.record_monitored(event.scene_name, region,
                                 event.event_name, event.capture_iso,

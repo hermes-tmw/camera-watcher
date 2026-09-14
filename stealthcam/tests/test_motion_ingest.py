@@ -742,29 +742,39 @@ class TestProcessEventRunner(unittest.TestCase):
         regions = {r[0] for r in conn.execute(
             "SELECT region FROM monitored_captures WHERE scope='wichita'"
         ).fetchall()}
-        self.assertIn("road", regions)
+        self.assertEqual(regions, {"road"},
+                         "road-only frame feeds ONLY the road denominator "
+                         "(#43 P2-3: pass-bys never inflate the driveway "
+                         "denominator)")
         conn.close()
         m.close()
 
-    def test_road_only_frame_still_counts_driveway_denominator(self):
-        """Issue #44 core shape: a frame whose only detections are road-band
-        pass-bys must STILL contribute the driveway denominator row — under
-        the old single-region attribution the whole frame went to 'road' and
-        genuine driveway denominator rows were lost."""
-        road_car = _mk_detection("car", 0.72, (500.0, 259.0, 576.0, 288.0))
-        m, s = self._run([road_car])
+    def test_road_edge_detection_counts_toward_road_denominator(self):
+        """P2-3 near-band: a road_edge detection is pass-by evidence — its
+        denominator row lands on 'road', never 'driveway'."""
+        # cy 0.415 is within ROAD_DEFAULT_EDGE (0.02) of y_max 0.42.
+        edge_car = _mk_detection("car", 0.6, (480.0, 286.0, 560.0, 312.0))
+        m, s = self._run([edge_car])
+        conn = sqlite3.connect(self.db)
+        regions = {r[0] for r in conn.execute(
+            "SELECT region FROM monitored_captures WHERE scope='wichita'"
+        ).fetchall()}
+        conn.close()
+        m.close()
+        self.assertEqual(regions, {"road"})
+
+    def test_frameless_of_detections_defaults_to_driveway(self):
+        """A processed frame with NO surviving detection still counts as a
+        property monitored capture (#43: every processed frame is
+        monitored) — the one case driveway is the default, not evidenced."""
+        m, s = self._run([])
         conn = sqlite3.connect(self.db)
         rows = conn.execute(
-            "SELECT region, guid, is_day FROM monitored_captures "
+            "SELECT region FROM monitored_captures "
             "WHERE scope='wichita'").fetchall()
         conn.close()
         m.close()
-        self.assertEqual({r for r, _, _ in rows}, {"driveway", "road"},
-                         "road-only frame must feed BOTH denominators")
-        self.assertEqual(len({g for _, g, _ in rows}), 1,
-                         "one frame = one guid, one row per region")
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(all(d == 1 for _, _, d in rows))
+        self.assertEqual([r for (r,) in rows], ["driveway"])
 
     def test_both_regions_frame_contributes_to_both_denominators(self):
         """THE issue #44 frame: road pass-by AND a driveway vehicle in the
