@@ -762,12 +762,71 @@ class TestProcessEventRunner(unittest.TestCase):
         road_car = _mk_detection("car", 0.72, (500.0, 259.0, 576.0, 288.0))
         m, s = self._run([road_car])
         conn = sqlite3.connect(self.db)
-        region = conn.execute(
+        regions = {r[0] for r in conn.execute(
             "SELECT region FROM monitored_captures WHERE scope='wichita'"
-        ).fetchone()[0]
-        self.assertEqual(region, "road")
+        ).fetchall()}
+        self.assertEqual(regions, {"road"},
+                         "road-only frame feeds ONLY the road denominator "
+                         "(#43 P2-3: pass-bys never inflate the driveway "
+                         "denominator)")
         conn.close()
         m.close()
+
+    def test_road_edge_detection_counts_toward_road_denominator(self):
+        """P2-3 near-band: a road_edge detection is pass-by evidence — its
+        denominator row lands on 'road', never 'driveway'."""
+        # cy 0.415 is within ROAD_DEFAULT_EDGE (0.02) of y_max 0.42.
+        edge_car = _mk_detection("car", 0.6, (480.0, 286.0, 560.0, 312.0))
+        m, s = self._run([edge_car])
+        conn = sqlite3.connect(self.db)
+        regions = {r[0] for r in conn.execute(
+            "SELECT region FROM monitored_captures WHERE scope='wichita'"
+        ).fetchall()}
+        conn.close()
+        m.close()
+        self.assertEqual(regions, {"road"})
+
+    def test_frameless_of_detections_defaults_to_driveway(self):
+        """A processed frame with NO surviving detection still counts as a
+        property monitored capture (#43: every processed frame is
+        monitored) — the one case driveway is the default, not evidenced."""
+        m, s = self._run([])
+        conn = sqlite3.connect(self.db)
+        rows = conn.execute(
+            "SELECT region FROM monitored_captures "
+            "WHERE scope='wichita'").fetchall()
+        conn.close()
+        m.close()
+        self.assertEqual([r for (r,) in rows], ["driveway"])
+
+    def test_both_regions_frame_contributes_to_both_denominators(self):
+        """THE issue #44 frame: road pass-by AND a driveway vehicle in the
+        same frame. The old code attributed the whole frame to 'road',
+        dropping the driveway denominator row; both regions must be counted."""
+        road_car = _mk_detection("car", 0.72, (500.0, 259.0, 576.0, 288.0))
+        drive_car = _mk_detection("car", 0.80, (100.0, 400.0, 300.0, 600.0))
+        m, s = self._run([road_car, drive_car])
+        conn = sqlite3.connect(self.db)
+        rows = conn.execute(
+            "SELECT region, guid FROM monitored_captures "
+            "WHERE scope='wichita'").fetchall()
+        conn.close()
+        m.close()
+        self.assertEqual(sorted(r for r, _ in rows), ["driveway", "road"])
+        self.assertEqual(len({g for _, g in rows}), 1,
+                         "both rows belong to the same event frame guid")
+
+    def test_driveway_only_frame_single_row(self):
+        drive_car = _mk_detection("car", 0.80, (100.0, 400.0, 300.0, 600.0))
+        m, s = self._run([drive_car])
+        conn = sqlite3.connect(self.db)
+        rows = conn.execute(
+            "SELECT region FROM monitored_captures "
+            "WHERE scope='wichita'").fetchall()
+        conn.close()
+        m.close()
+        self.assertEqual([r for (r,) in rows], ["driveway"],
+                         "no road detection -> no road denominator row")
 
     def test_degenerate_bbox_skipped_loudly(self):
         bad = _mk_detection("car", 0.9, (300.0, 300.0, 300.0, 300.0))

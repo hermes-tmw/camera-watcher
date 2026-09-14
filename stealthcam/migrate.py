@@ -51,7 +51,14 @@ DEFAULT_STAMP = "taylor_hill"
 # DB passed this module's checks, so it skips the per-boot sqlite_master
 # scan. BUMP THIS whenever the scoped schema or migration changes shape —
 # DBs stamped with an older epoch re-run the full check on next open.
-SCHEMA_EPOCH_USER_VERSION = 1
+#
+# Epoch history:
+#   1 = per-location scope dimension (2026-09-13, PR #42).
+#   2 = region-aware monitored_captures PK (2026-09-13, issue #44 / Percy
+#       PR#43 P2-4): PK widened (scope, direction, region, guid) so one
+#       frame can contribute one denominator row PER REGION; epoch-1 DBs
+#       re-run the full check on next open and get the in-place PK upgrade.
+SCHEMA_EPOCH_USER_VERSION = 2
 
 # Tables that must be rebuilt with a scope column + composite PK. Each entry:
 # (table, pk-without-scope, all-columns-with-types, not-null-columns).
@@ -140,7 +147,7 @@ _SCOPE_TABLES: dict[str, dict] = {
         },
     },
     "monitored_captures": {
-        "pk": ["direction", "guid"],
+        "pk": ["direction", "region", "guid"],
         "cols": {
             "direction": "TEXT NOT NULL",
             "region": "TEXT",
@@ -163,6 +170,69 @@ _SCOPE_INDEXES = {
     "memory_observations": "CREATE INDEX IF NOT EXISTS idx_memory_obs_scope_dir "
                            "ON memory_observations (scope, direction)",
 }
+
+# PK-shape fixes applied IN PLACE to already-scoped DBs (epoch upgrades).
+# Epoch-1 monitored_captures PKed on (scope, direction, guid); issue #44
+# widened it to (scope, direction, region, guid) so a frame evidencing both
+# road and driveway contributes one denominator row PER REGION. Each entry:
+# (old-pk-without-scope, new-pk-without-scope). A table whose PK already
+# matches the new shape is skipped (idempotent).
+_PK_UPGRADES: dict[str, tuple[list[str], list[str]]] = {
+    "monitored_captures": (["direction", "guid"], ["direction", "region", "guid"]),
+}
+
+
+def _upgrade_pk_shapes(conn: sqlite3.Connection, stamp: str) -> dict:
+    """Rebuild already-scoped tables whose PK shape predates the current
+    spec (epoch upgrades), preserving every row and its scope value.
+
+    Runs inside one explicit transaction per table (SQLite DDL is
+    transactional — a crash mid-rebuild rolls the table back whole). Rows
+    keep their ORIGINAL scope (never re-stamped). A PK collision under the
+    widened key means the legacy data was already region-ambiguous in a way
+    the old PK silently collapsed — fail loudly rather than drop rows.
+    """
+    upgraded: dict[str, int] = {}
+    for table, (old_pk, new_pk) in _PK_UPGRADES.items():
+        if not _table_exists(conn, table):
+            continue
+        if not _is_scoped(conn, table):
+            continue  # legacy shape: handled by the rebuild path below
+        cur_pk = _pk_cols(conn, table)
+        expected_old = ["scope"] + old_pk
+        if cur_pk == ["scope"] + new_pk:
+            continue  # already upgraded
+        if cur_pk != expected_old:
+            raise RuntimeError(
+                f"{table}: PK {cur_pk} matches neither the epoch-1 shape "
+                f"{expected_old} nor the current shape "
+                f"{['scope'] + new_pk}; refusing to guess (manual "
+                f"reconciliation required)")
+        spec = _SCOPE_TABLES[table]
+        cols = list(spec["cols"].keys())
+        sel_cols = ", ".join(["scope"] + cols)
+        ins_cols = sel_cols
+        placeholders = ", ".join(["?"] * (len(cols) + 1))
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
+            _create_scoped(conn, table, spec, stamp)
+            rows = conn.execute(
+                f"SELECT {sel_cols} FROM {table}_legacy").fetchall()
+            conn.executemany(
+                f"INSERT INTO {table}_new ({ins_cols}) VALUES ({placeholders})",
+                rows,
+            )
+            conn.execute(f"DROP TABLE {table}_legacy")
+            conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+            if table in _SCOPE_INDEXES:
+                conn.execute(_SCOPE_INDEXES[table])
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
+        upgraded[table] = len(rows)
+    return upgraded
 
 
 def _is_scoped(conn: sqlite3.Connection, table: str) -> bool:
@@ -270,7 +340,14 @@ def migrate_scoped_db(conn: sqlite3.Connection,
 
     not_scoped = [t for t in scoped_targets if not _is_scoped(conn, t)]
     if not not_scoped:
-        # All present tables already carry scope — verify PKs include it.
+        # All present tables already carry scope — verify PKs include it,
+        # then apply any epoch PK-shape upgrades (issue #44: monitored_captures
+        # (scope, direction, guid) -> (scope, direction, region, guid)).
+        # Row-preserving, scope-preserving, one transaction per table.
+        upgraded = _upgrade_pk_shapes(conn, stamp)
+        if upgraded:
+            report["status"] = "upgraded"
+            report["pk_upgraded"] = upgraded
         for t in scoped_targets:
             pk = _pk_cols(conn, t)
             if pk[:1] != ["scope"] and _SCOPE_TABLES[t]["pk"]:
@@ -371,6 +448,36 @@ def _ensure_backup(db_path: Path, backup_dir: str | None = None) -> Path | None:
     return target
 
 
+def _pk_upgrade_pending(conn: sqlite3.Connection) -> bool:
+    """True when an already-scoped table still carries a pre-epoch PK shape
+    that _upgrade_pk_shapes would rebuild (used to decide the epoch backup)."""
+    for table, (old_pk, _new_pk) in _PK_UPGRADES.items():
+        if not _table_exists(conn, table) or not _is_scoped(conn, table):
+            continue
+        if _pk_cols(conn, table) == ["scope"] + old_pk:
+            return True
+    return False
+
+
+def _ensure_epoch_backup(db_path: Path, epoch: int) -> Path | None:
+    """One-time snapshot before an in-place PK-shape upgrade (epoch bump).
+
+    Same idempotence rule as _ensure_backup: an existing snapshot is never
+    overwritten (the pre-upgrade bytes are the artifact). A separate file
+    from the epoch-1 pre-scope snapshot — that one holds pre-scope data and
+    is consumed by a different rollback path; the PK upgrade needs ITS OWN
+    rollback point. Skipped for non-file / zero-byte DBs (nothing to roll
+    back).
+    """
+    if not db_path.is_file() or db_path.stat().st_size == 0:
+        return None
+    target = db_path.with_name(
+        db_path.name + f".pre-epoch{epoch}-pk-upgrade.bak")
+    if not target.is_file():
+        _snapshot(db_path, target)
+    return target
+
+
 def migrate_db_open(db_path: str | Path, conn: sqlite3.Connection,
                     stamp: str = DEFAULT_STAMP,
                     backup_dir: str | None = None,
@@ -392,6 +499,15 @@ def migrate_db_open(db_path: str | Path, conn: sqlite3.Connection,
     path = Path(db_path)
     if str(path) != ":memory:" and not db_is_new:
         _ensure_backup(path, backup_dir)
+    # Epoch-upgrade path (issue #44): an already-scoped DB whose
+    # monitored_captures PK predates the region-aware shape gets its own
+    # one-time rollback snapshot before the in-place rebuild — the epoch-1
+    # pre-scope .bak holds pre-scope data and is the WRONG rollback point
+    # for this upgrade. Same idempotence rule: never overwrite an existing
+    # snapshot. (The scoped-shape check needs the caller's connection; the
+    # snapshot itself uses the backup API against the file.)
+    if str(path) != ":memory:" and _pk_upgrade_pending(conn):
+        _ensure_epoch_backup(path, SCHEMA_EPOCH_USER_VERSION)
     return migrate_scoped_db(conn, stamp=stamp)
 
 
@@ -410,6 +526,10 @@ def migrate_file(db_path: str | Path, stamp: str = DEFAULT_STAMP,
         _ensure_backup(path, backup_dir)
     conn = sqlite3.connect(str(path))
     try:
+        # Epoch-upgrade snapshot (issue #44) — same policy as the auto path:
+        # one-time, never overwrites, taken only when a PK rebuild is pending.
+        if backup and _pk_upgrade_pending(conn):
+            _ensure_epoch_backup(path, SCHEMA_EPOCH_USER_VERSION)
         report = migrate_scoped_db(conn, stamp=stamp)
         conn.commit()
         # WAL may hold the migration in -wal; checkpoint so the main file
@@ -447,6 +567,18 @@ def main(argv: list[str] | None = None) -> int:
             targets = [t for t in _SCOPE_TABLES if t in existing]
             pending = [t for t in targets if not _is_scoped(conn, t)]
             print("dry-run: tables needing migration:", pending or "none")
+            # Epoch PK-shape upgrades (issue #44): already-scoped tables whose
+            # PK predates the current spec (rebuilt in place, rows preserved).
+            pk_pending = {}
+            for t, (old_pk, new_pk) in _PK_UPGRADES.items():
+                if t not in existing or not _is_scoped(conn, t):
+                    continue
+                cur = _pk_cols(conn, t)
+                if cur == ["scope"] + new_pk or cur != ["scope"] + old_pk:
+                    continue
+                pk_pending[t] = cur
+            print("dry-run: scoped tables needing PK upgrade:",
+                  pk_pending or "none")
             for t in targets:
                 n = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
                 print(f"  {t}: {n} rows")
@@ -458,6 +590,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"migration: {report['status']}")
     for table, n in report["tables"].items():
         print(f"  {table}: {n} rows stamped scope='{args.stamp}'")
+    for table, n in report.get("pk_upgraded", {}).items():
+        print(f"  {table}: PK upgraded in place, {n} rows preserved")
     return 0
 
 

@@ -401,5 +401,133 @@ class TestExpectedHysteresis(unittest.TestCase):
         m.close()
 
 
+class TestRegionAwareDenominator(unittest.TestCase):
+    """Issue #44 (Percy PR#43 P2-4): the presence-ratio denominator must be
+    PER REGION — road pass-by volume must not dilute the driveway
+    expectedness ratio (and vice versa)."""
+
+    def test_road_volume_does_not_dilute_driveway_ratio(self):
+        # THE defect shape: my truck sits in the driveway (presence rows),
+        # while heavy road traffic pumps the old region-blind denominator.
+        # Expectedness must be computed against the driveway denominator only.
+        m = _mk_memory()
+        bbox = (100.0, 100.0, 300.0, 300.0)
+        t0 = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+        eid = None
+        for k in range(8):
+            t = t0 + timedelta(hours=k)
+            d = m.decide("East", "car", bbox, now=_iso(t),
+                         fingerprint=_fp("my-truck"), region="driveway",
+                         guid=str(uuid.uuid4()))
+            eid = d.entity_id
+        # Denominator: 10 driveway + 90 road monitored captures, same window.
+        for k in range(10):
+            t = t0 + timedelta(hours=k)
+            m.record_monitored("East", "driveway", str(uuid.uuid4()), _iso(t))
+        for k in range(90):
+            t = t0 + timedelta(hours=k % 20, minutes=k)
+            m.record_monitored("East", "road", f"road-{k}", _iso(t))
+        # 8/10 driveway = 0.8 >= 0.5 -> expected. Under the old region-blind
+        # denominator (8/100 = 0.08) this sighting ALERTS.
+        d = m.decide("East", "car", bbox, now=_iso(t0 + timedelta(hours=10)),
+                     fingerprint=_fp("my-truck"), region="driveway",
+                     guid=str(uuid.uuid4()))
+        self.assertEqual(d.decision, NOTE,
+                         "road volume must not dilute the driveway ratio")
+        self.assertEqual(d.entity_id, eid)
+        self.assertEqual(d.tag, TAG_BACKGROUND)
+        m.close()
+
+    def test_ratio_denominator_excludes_other_region_rows(self):
+        m = _mk_memory()
+        t0 = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+        for k in range(4):
+            t = t0 + timedelta(hours=k)
+            m.record_monitored("East", "driveway", f"d{k}", _iso(t))
+        for k in range(6):
+            t = t0 + timedelta(hours=k)
+            m.record_monitored("East", "road", f"r{k}", _iso(t))
+        eid = "e-irrelevant"
+        # entity_presence: 2 sightings (numerator is direction-scoped, not
+        # region-tagged — the DEFECT was in the denominator).
+        m.record_presence(eid, "East", "d0", _iso(t0))
+        m.record_presence(eid, "East", "d1", _iso(t0 + timedelta(hours=1)))
+        # Driveway: 2/4 = 0.5; the region-blind count would be 2/10 = 0.2.
+        self.assertEqual(m.presence_ratio(eid, "East", _iso(t0 + timedelta(hours=5)),
+                                          region="driveway"), 0.5)
+        # Same entity, same direction, road denominator only: 2/6 — distinct
+        # from the driveway ratio, proving the denominator filter bites.
+        self.assertEqual(m.presence_ratio(eid, "East", _iso(t0 + timedelta(hours=5)),
+                                          region="road"), 2 / 6)
+        m.close()
+
+    def test_same_guid_can_hold_one_row_per_region(self):
+        # The widened PK (scope, direction, region, guid): one frame
+        # evidencing both regions contributes BOTH denominator rows.
+        m = _mk_memory()
+        t0 = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+        m.record_monitored("East", "driveway", "frame-1", _iso(t0))
+        m.record_monitored("East", "road", "frame-1", _iso(t0))
+        # Same region+guid is still deduped (INSERT OR IGNORE semantics).
+        m.record_monitored("East", "driveway", "frame-1", _iso(t0))
+        rows = m._conn.execute(
+            "SELECT region FROM monitored_captures ORDER BY region").fetchall()
+        self.assertEqual([r for (r,) in rows], ["driveway", "road"])
+        m.close()
+
+    def test_record_monitored_rejects_unattributed_region(self):
+        m = _mk_memory()
+        t0 = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+        with self.assertRaises(ValueError):
+            m.record_monitored("East", None, "g", _iso(t0))
+        with self.assertRaises(ValueError):
+            m.record_monitored("East", "", "g", _iso(t0))
+        with self.assertRaises(ValueError):
+            m.record_monitored("East", "front-yard", "g", _iso(t0))
+        n = m._conn.execute(
+            "SELECT COUNT(*) FROM monitored_captures").fetchone()[0]
+        self.assertEqual(n, 0, "rejected calls must not write rows")
+        m.close()
+
+    def test_presence_ratio_requires_region(self):
+        m = _mk_memory()
+        t0 = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+        with self.assertRaises(ValueError):
+            m.presence_ratio("e", "East", _iso(t0))
+        with self.assertRaises(ValueError):
+            m.presence_ratio("e", "East", _iso(t0), region="garage")
+        m.close()
+
+    def test_both_regions_frame_still_finds_driveway_expected(self):
+        """End-to-end shape at the engine level: baseline seeded through
+        frames that carry BOTH road and driveway evidence (one row each),
+        then a steady stream of road-only frames must NOT stretch the
+        driveway ratio below the expectedness threshold."""
+        m = _mk_memory()
+        bbox = (100.0, 100.0, 300.0, 300.0)
+        t0 = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+        eid = None
+        for k in range(6):
+            t = t0 + timedelta(hours=k)
+            d = m.decide("East", "car", bbox, now=_iso(t),
+                         fingerprint=_fp("resident"), region="driveway",
+                         guid=f"both-{k}")
+            eid = d.entity_id
+            # The adapter's per-region accounting for a both-regions frame.
+            m.record_monitored("East", "driveway", f"both-{k}", _iso(t))
+            m.record_monitored("East", "road", f"both-{k}", _iso(t))
+        # A day of road-only traffic (old code: whole frame -> road).
+        for k in range(20):
+            t = t0 + timedelta(hours=6, minutes=10 * k)
+            m.record_monitored("East", "road", f"pass-{k}", _iso(t))
+        d = m.decide("East", "car", bbox, now=_iso(t0 + timedelta(hours=12)),
+                     fingerprint=_fp("resident"), region="driveway",
+                     guid=str(uuid.uuid4()))
+        # Driveway ratio 6/7 >= 0.5 -> expected note; region-blind 6/27 alerts.
+        self.assertEqual(d.decision, NOTE)
+        self.assertEqual(d.entity_id, eid)
+        m.close()
+
+
 if __name__ == "__main__":
     unittest.main()

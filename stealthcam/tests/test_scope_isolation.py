@@ -303,9 +303,10 @@ CREATE TABLE monitored_captures (direction TEXT NOT NULL, region TEXT, guid TEXT
             self.assertEqual(
                 conn.execute(f"SELECT COUNT(*) FROM {t} WHERE scope IS NULL")
                 .fetchone()[0], 0)
-        # Composite PKs include scope, scope-first.
+        # Composite PKs include scope, scope-first. monitored_captures is
+        # epoch-2 (issue #44): PK (scope, direction, region, guid).
         for t, pk_len in (("seen_guids", 2), ("entities", 2),
-                          ("entity_presence", 4), ("monitored_captures", 3),
+                          ("entity_presence", 4), ("monitored_captures", 4),
                           ("deferred_captures", 2)):
             info = conn.execute(f"PRAGMA table_info({t})").fetchall()
             pk = [r[1] for r in sorted((r for r in info if r[5] > 0),
@@ -1006,6 +1007,170 @@ class TestScopeConfig(unittest.TestCase):
                               clear=False):
             with self.assertRaises(ValueError):
                 load_config("/nonexistent/config.yaml")
+
+
+class TestEpoch2PkUpgrade(unittest.TestCase):
+    """Issue #44 (Percy PR#43 P2-4): the monitored_captures PK widens from
+    (scope, direction, guid) to (scope, direction, region, guid) so one frame
+    can contribute one denominator row PER REGION. Epoch-1 (already-scoped)
+    DBs must upgrade in place, row- and scope-preserving, with a one-time
+    epoch backup on both the auto and CLI paths."""
+
+    def _epoch1_db(self) -> tuple[Path, int]:
+        """Build an epoch-1-shaped DB (region-blind PK) with real rows."""
+        path = self.dir / "epoch1.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript("""
+CREATE TABLE monitored_captures (
+    scope TEXT NOT NULL DEFAULT 'taylor_hill',
+    direction TEXT NOT NULL, region TEXT, guid TEXT NOT NULL,
+    captured_at TEXT NOT NULL, ts REAL NOT NULL,
+    is_day INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (scope, direction, guid));
+""")
+        rows = [
+            ("taylor_hill", "West", "driveway", "f1", _iso(_T0), 1.0, 1),
+            ("taylor_hill", "West", "road", "f1-road", _iso(_T0), 1.0, 1),
+            ("taylor_hill", "West", "driveway", "f2", _iso(_T0), 1.0, 1),
+            ("wichita", "WichitaDriveway", "road", "m1", _iso(_T0), 1.0, 0),
+        ]
+        for r in rows:
+            conn.execute(
+                "INSERT INTO monitored_captures (scope, direction, region, "
+                "guid, captured_at, ts, is_day) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                r)
+        conn.commit()
+        conn.close()
+        return path, 4
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="epoch2-"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _pk(self, conn, table):
+        info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return [r[1] for r in sorted((r for r in info if r[5] > 0),
+                                     key=lambda r: r[5])]
+
+    def test_pk_upgrade_preserves_rows_and_scope(self):
+        path, n = self._epoch1_db()
+        conn = sqlite3.connect(str(path))
+        report = migrate_scoped_db(conn)
+        self.assertEqual(report["status"], "upgraded")
+        self.assertEqual(report["pk_upgraded"], {"monitored_captures": 4})
+        conn.commit()
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM monitored_captures")
+            .fetchone()[0], n, "every row preserved")
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM monitored_captures "
+                         "WHERE scope IS NULL OR scope = ''").fetchone()[0], 0)
+        self.assertEqual(
+            self._pk(conn, "monitored_captures"),
+            ["scope", "direction", "region", "guid"],
+            "PK must be the region-aware shape after upgrade")
+        # Both scope values survived (never re-stamped).
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM monitored_captures "
+                         "WHERE scope='wichita'").fetchone()[0], 1)
+        conn.close()
+
+    def test_pk_upgrade_idempotent(self):
+        path, n = self._epoch1_db()
+        conn = sqlite3.connect(str(path))
+        r1 = migrate_scoped_db(conn)
+        self.assertEqual(r1["status"], "upgraded")
+        conn.commit()
+        r2 = migrate_scoped_db(conn)
+        conn.commit()
+        self.assertEqual(r2["status"], "already-scoped")
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM monitored_captures")
+            .fetchone()[0], n)
+        conn.close()
+
+    def test_epoch1_and_legacy_dbs_reject_unknown_pk_shape(self):
+        # A DB whose PK matches NEITHER the epoch-1 nor the current shape is
+        # a manual-reconciliation situation, never a silent guess.
+        path = self.dir / "weird.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript("""
+CREATE TABLE monitored_captures (
+    scope TEXT NOT NULL, direction TEXT NOT NULL, region TEXT,
+    guid TEXT NOT NULL, captured_at TEXT NOT NULL, ts REAL NOT NULL,
+    is_day INTEGER NOT NULL DEFAULT 1, extra TEXT,
+    PRIMARY KEY (scope, direction, guid, extra));
+""")
+        conn.commit()
+        with self.assertRaises(RuntimeError):
+            migrate_scoped_db(conn)
+        conn.close()
+
+    def test_auto_open_takes_epoch_backup_before_upgrade(self):
+        path, n = self._epoch1_db()
+        mem = Memory(str(path), scope="taylor_hill",
+                     fingerprinter=_TrivialFingerprinter())
+        try:
+            bak = path.with_name("epoch1.db.pre-epoch2-pk-upgrade.bak")
+            self.assertTrue(bak.is_file(),
+                            "epoch-upgrade must snapshot before rebuilding")
+            # The backup holds the PRE-upgrade PK shape.
+            bak_conn = sqlite3.connect(str(bak))
+            pk = [r[1] for r in sorted(
+                (r for r in bak_conn.execute(
+                    "PRAGMA table_info(monitored_captures)") if r[5] > 0),
+                key=lambda r: r[5])]
+            bak_conn.close()
+            self.assertEqual(pk, ["scope", "direction", "guid"])
+            # And the live DB is upgraded and functional.
+            mem.record_monitored("West", "driveway", "g-new", _iso(_T0))
+            self.assertEqual(
+                mem._conn.execute(
+                    "SELECT COUNT(*) FROM monitored_captures "
+                    "WHERE region='driveway'").fetchone()[0], 3)
+        finally:
+            mem.close()
+
+    def test_auto_open_upgraded_db_stamps_current_epoch(self):
+        path, _ = self._epoch1_db()
+        mem = Memory(str(path), scope="taylor_hill",
+                     fingerprinter=_TrivialFingerprinter())
+        try:
+            conn = sqlite3.connect(str(path))
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                SCHEMA_EPOCH_USER_VERSION)
+            conn.close()
+        finally:
+            mem.close()
+
+    def test_fresh_memory_schema_has_region_pk(self):
+        m = Memory(":memory:", scope="taylor_hill",
+                   fingerprinter=_TrivialFingerprinter())
+        try:
+            pk = [r[1] for r in sorted(
+                (r for r in m._conn.execute(
+                    "PRAGMA table_info(monitored_captures)") if r[5] > 0),
+                key=lambda r: r[5])]
+            self.assertEqual(pk, ["scope", "direction", "region", "guid"])
+        finally:
+            m.close()
+
+    def test_cli_migrate_reports_pk_upgrade(self):
+        path, _ = self._epoch1_db()
+        from stealthcam.migrate import main as migrate_main
+        rc = migrate_main([str(path), "--no-backup"])
+        self.assertEqual(rc, 0)
+        conn = sqlite3.connect(str(path))
+        try:
+            self.assertEqual(
+                self._pk(conn, "monitored_captures"),
+                ["scope", "direction", "region", "guid"])
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":
