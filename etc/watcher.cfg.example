@@ -60,6 +60,13 @@ API_KEY=CHANGE_ME
 STILL_MODEL_FILE=/usr/local/etc/model.pkl
 
 [classification]
+# Primary classifier: on-device yolo11n (5.6 MB, CPU) — no VRAM model-load
+# churn, no ollama round-trip. Decider string in Labeling is 'ollama:yolo11n'
+# (browser ML filters match via the ollama: prefix). The VLM below stays as
+# the fallback when weights are missing or YOLO_DISABLE=true.
+YOLO_WEIGHTS=/data/video/watcher/stealthcam/yolo11n.pt
 # Ollama API endpoint. In Docker use http://host.docker.internal:11434
 OLLAMA_HOST=http://localhost:11434
 MODEL=llama3.2-vision:latest
+# Set true to force the VLM and skip yolo entirely.
+#YOLO_DISABLE=true

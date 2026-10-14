@@ -11,3 +11,8 @@ pytz
 pillow
 psycopg2-binary
 pydantic
+# on-device primary classifier (yolo11n): CPU torch, no CUDA wheels
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+ultralytics

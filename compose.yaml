@@ -84,6 +84,8 @@ services:
       - WATCHER_CONFIG=/usr/local/etc/watcher.cfg
       - WATCHER_LOG_FILE=/var/log/watcher/classifier.log
       - WATCHER_CLASSIFICATION_OLLAMA_HOST=http://host.docker.internal:11434
+      - WATCHER_CLASSIFICATION_YOLO_WEIGHTS=/data/video/watcher/stealthcam/yolo11n.pt
+      - ULTRALYTICS_SAFE_LOAD=1
     restart: always
 
   stealthcam:
@@ -118,6 +120,7 @@ services:
       - STEALTHCAM_DETECTOR_WEIGHTS=/data/video/watcher/stealthcam/yolo11n.pt
       - STEALTHCAM_DETECTOR_DEVICE=cpu
       - STEALTHCAM_DESCRIBER_OLLAMA_HOST=http://host.docker.internal:11434
+      - STEALTHCAM_DESCRIBER_MODEL=qwen2.5vl:latest
       - STEALTHCAM_DIRECTION_REGIONS=west=driveway
     restart: always
 
@@ -156,6 +159,7 @@ services:
       - STEALTHCAM_DETECTOR_WEIGHTS=/data/video/watcher/stealthcam/yolo11n.pt
       - STEALTHCAM_DETECTOR_DEVICE=cpu
       - STEALTHCAM_DESCRIBER_OLLAMA_HOST=http://host.docker.internal:11434
+      - STEALTHCAM_DESCRIBER_MODEL=qwen2.5vl:latest
       - STEALTHCAM_MEMORY_SCOPE=wichita
       - STEALTHCAM_SCOPES={"wichita":{"event_scenes":["WichitaDriveway"],"detector_conf_threshold":0.45,"event_poll_seconds":300,"event_backlog_max":200,"road_band_y_max":0.42,"road_band_x_min":0.30,"road_band_x_max":0.52}}
     restart: always

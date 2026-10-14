@@ -1,6 +1,6 @@
 FROM python:3-bookworm
 
-RUN apt-get update && apt-get -y install sqlite3 redis ffmpeg
+RUN apt-get update && apt-get -y install sqlite3 redis ffmpeg libgl1 libglib2.0-0
 
 WORKDIR /app
 COPY requirements-classifier.txt ./
@@ -14,6 +14,9 @@ COPY watcher watcher/
 
 ARG GIT_VERSION=unknown
 RUN echo $GIT_VERSION > VERSION
+
+# Defense-in-depth: load .pt weights with torch weights_only=True (no pickle).
+ENV ULTRALYTICS_SAFE_LOAD=1
 
 # Build-time config: prefer the operator's real etc/watcher.cfg; when absent
 # (it is git-ignored) bake the committed example instead. Runtime reads the

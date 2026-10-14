@@ -157,9 +157,65 @@ def _query_ollama(img: Image.Image, model: str = None, event_name: str = '') -> 
     return parsed
 
 
+def _use_yolo() -> bool:
+    """YOLO11n is the primary classifier (GH#23 decision, fan-cycling fix
+    2026-10-14); the VLM path stays as fallback. Disable with
+    [classification] YOLO_DISABLE=true in watcher.cfg."""
+    from .connection import application_config
+    if (application_config("classification", "YOLO_DISABLE") or "").strip().lower() in ("1", "true", "yes"):
+        return False
+    from .classify_yolo import _weights_path
+    return _weights_path().exists()
+
+
+def _task_classify_yolo(event_name: str):
+    """Classify + write the Labeling row using on-device yolo11n."""
+    from .classify_yolo import _classify_yolo
+
+    with TunneledConnection() as tc:
+        session = sqlalchemy.orm.Session(tc)
+        event = EventObservation.by_name(session, event_name)
+        if not event:
+            raise ValueError(f"event {event_name} not found in database")
+
+        img = _frame_from_event(event)
+        result = _classify_yolo(img, event_name)
+
+        category = result.get("category", "unknown")
+        interesting = bool(result.get("interesting", False))
+        confidence = float(result.get("confidence", 0.0))
+        description = result.get("description", "") or ""
+
+        logger.info(f"{event_name}: {category} interesting={interesting} conf={confidence:.2f} [yolo11n] — {description}")
+
+        labels = [category]
+        if not interesting:
+            labels.append("noise")
+
+        lbl = Labeling(
+            event_id=event.id,
+            decider="ollama:yolo11n",
+            decided_at=datetime.now(),
+            labels=labels,
+            probabilities=[confidence],
+            description=description or None,
+            git_version=git_version(),
+            mask=None,
+        )
+        session.add(lbl)
+        session.commit()
+
+
 def task_classify_motion(event_name: str, model: str = None):
     model = model or _ollama_model()
     logger.debug(f"classifying {event_name} with {model}")
+
+    # Primary path: on-device yolo11n — no VRAM model-load churn. An explicit
+    # VLM model via --model still forces the ollama path.
+    vlm_requested = model is not None and any(
+        t in model.lower() for t in ("llama", "vision", "vl", "moondream"))
+    if not vlm_requested and _use_yolo():
+        return _task_classify_yolo(event_name)
 
     with TunneledConnection() as tc:
         session = sqlalchemy.orm.Session(tc)
